@@ -23,7 +23,7 @@ class PublishResp:
 class FetchResp:
     messages: list
     next_seq: int
-    has_more: bool = False
+    last_seq: int
 
 
 @dataclass
@@ -39,6 +39,7 @@ class FakeOpenEvent:
     def __init__(self):
         self.published = []
         self.results = []
+        self.fetch_calls = []
         self.next_publish_seq = 10
 
     def publish_auto_seq(self, principal, token, channel_id, payload, recipients):
@@ -56,10 +57,23 @@ class FakeOpenEvent:
         )
         return PublishResp(seq)
 
-    def fetch(self, principal, token, from_seq, limit, only_my_recipient=False):
-        messages = [item for item in self.results if item.seq >= from_seq][:limit]
-        next_seq = messages[-1].seq + 1 if messages else from_seq
-        return FetchResp(messages=messages, next_seq=next_seq)
+    def fetch(self, principal, token, from_seq, limit, only_my_recipient=False, channels=()):
+        self.fetch_calls.append(
+            {
+                "from_seq": from_seq,
+                "limit": limit,
+                "only_my_recipient": only_my_recipient,
+                "channels": tuple(channels),
+            }
+        )
+        matches = [item for item in self.results if item.seq >= from_seq]
+        if channels:
+            requested_channels = {int(channel) for channel in channels}
+            matches = [item for item in matches if int(item.channel_id) in requested_channels]
+        messages = matches[:limit]
+        last_seq = max((item.seq for item in self.results), default=0)
+        next_seq = messages[-1].seq + 1 if len(matches) > len(messages) else last_seq + 1
+        return FetchResp(messages=messages, next_seq=next_seq, last_seq=last_seq)
 
 
 def _result(seq, channel_id, request_id, prev_seq, status_code=200, body=None):
@@ -103,6 +117,7 @@ class OpenAILikeTests(unittest.TestCase):
         self.assertEqual(response.openevent_seq, 10)
         self.assertEqual(response.choices[0].message.content, "ok")
         self.assertEqual(event.published[0]["recipients"], ())
+        self.assertEqual(event.fetch_calls[0]["channels"], (1,))
         self.assertIn(b'"/v1/chat/completions"', event.published[0]["payload"])
 
     def test_responses_create_publishes_responses_path(self):
@@ -160,7 +175,7 @@ class OpenAILikeTests(unittest.TestCase):
 
     def test_auto_retry_generates_new_request_id(self):
         class FailingFetchOpenEvent(FakeOpenEvent):
-            def fetch(self, principal, token, from_seq, limit, only_my_recipient=False):
+            def fetch(self, principal, token, from_seq, limit, only_my_recipient=False, channels=()):
                 raise OSError("temporary")
 
         event = FailingFetchOpenEvent()

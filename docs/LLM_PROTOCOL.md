@@ -95,9 +95,9 @@ or mismatched field types are invalid payloads.
 
 ### 2.1 OpenEvent Top-Level Fields
 
-`principal` is a top-level OpenEvent Message field and is not stored inside the
+`principal` is a top-level OpenEvent EventMessage field and is not stored inside the
 `llm.v1` payload. All source identity checks in this protocol use the OpenEvent
-Message `principal`:
+EventMessage `principal`:
 
 - `infer.request`: OpenEvent `principal` must be the business caller principal
   that submits the inference request.

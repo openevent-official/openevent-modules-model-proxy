@@ -74,7 +74,7 @@ LLM channel 约束：
 
 ### 2.1 OpenEvent 顶层字段
 
-`principal` 是 OpenEvent Message 的顶层字段，不放入 `llm.v1` payload。协议内所有来源身份判断都以 OpenEvent Message 的 `principal` 为准：
+`principal` 是 OpenEvent EventMessage 的顶层字段，不放入 `llm.v1` payload。协议内所有来源身份判断都以 OpenEvent EventMessage 的 `principal` 为准：
 
 - `infer.request`：OpenEvent `principal` 必须使用提交推理请求的业务调用方 principal
 - `infer.result`：OpenEvent `principal` 必须使用 `model-proxy` principal

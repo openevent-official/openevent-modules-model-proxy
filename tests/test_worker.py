@@ -26,6 +26,13 @@ class PublishResp:
 
 
 @dataclass
+class FetchResp:
+    messages: list[Message]
+    next_seq: int
+    last_seq: int
+
+
+@dataclass
 class Channel:
     protocol: str = "llm.v1"
     visibility: int = 2
@@ -39,8 +46,10 @@ class ChannelResp:
 
 
 class FakeOpenEvent:
-    def __init__(self):
+    def __init__(self, messages=None):
         self.published = []
+        self.messages = list(messages or [])
+        self.fetch_calls = []
 
     def get_channel(self, principal, token, channel_id):
         return ChannelResp(Channel())
@@ -48,6 +57,17 @@ class FakeOpenEvent:
     def publish_auto_seq(self, principal, token, channel_id, payload, recipients):
         self.published.append((channel_id, payload, tuple(recipients)))
         return PublishResp(seq=100 + len(self.published))
+
+    def fetch(self, principal, token, from_seq, limit, only_my_recipient=False, channels=()):
+        self.fetch_calls.append((from_seq, limit, only_my_recipient, tuple(channels)))
+        matches = [message for message in self.messages if message.seq >= from_seq]
+        if channels:
+            requested_channels = {int(channel) for channel in channels}
+            matches = [message for message in matches if int(message.channel_id) in requested_channels]
+        batch = matches[:limit]
+        last_seq = max((message.seq for message in self.messages), default=0)
+        next_seq = batch[-1].seq + 1 if len(matches) > len(batch) else last_seq + 1
+        return FetchResp(messages=batch, next_seq=next_seq, last_seq=last_seq)
 
 
 def _config(tmp_path):
@@ -153,6 +173,16 @@ class WorkerTests(unittest.TestCase):
             same = worker._observe_message(_request(1, "req_a"), realtime=False, deferred_results=[])
             self.assertIsNotNone(same)
             self.assertEqual(len(event.published), 0)
+
+    def test_recover_uses_next_seq_without_has_more(self):
+        with tempfile.TemporaryDirectory() as td:
+            event = FakeOpenEvent(messages=[_request(1, "req_a")])
+            worker = ModelProxyWorker(_config(Path(td)), event)
+
+            pending = worker.recover(1)
+
+            self.assertEqual([item.seq for item in pending], [1])
+            self.assertEqual(event.fetch_calls, [(1, 1000, False, ())])
 
     def test_recovery_does_not_duplicate_existing_duplicate_rejection(self):
         with tempfile.TemporaryDirectory() as td:

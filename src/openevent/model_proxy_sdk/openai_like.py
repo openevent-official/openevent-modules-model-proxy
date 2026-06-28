@@ -173,10 +173,12 @@ class OpenAI:
                     from_seq=from_seq,
                     limit=1000,
                     only_my_recipient=True,
+                    channels=[self._channel_id],
                 )
             except Exception as exc:
                 raise _map_transport_error(exc, request_id=request_id) from exc
             next_seq = int(getattr(response, "next_seq", from_seq))
+            last_seq = int(getattr(response, "last_seq", next_seq - 1))
             for message in getattr(response, "messages", ()):
                 message_seq = int(message.seq)
                 if message_seq >= next_seq:
@@ -196,7 +198,7 @@ class OpenAI:
                     return payload
             if next_seq > from_seq:
                 from_seq = next_seq
-            if bool(getattr(response, "has_more", False)):
+            if next_seq <= last_seq:
                 continue
             time.sleep(min(0.05, max(0.001, remaining_s)))
 

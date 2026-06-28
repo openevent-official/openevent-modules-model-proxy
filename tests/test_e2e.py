@@ -193,6 +193,7 @@ class ModelProxyE2ETests(unittest.TestCase):
                 from_seq=request_seq,
                 limit=1000,
                 only_my_recipient=False,
+                channels=[channel.channel_id],
             )
             parsed = [parse_message(message) for message in response.messages]
             results = [

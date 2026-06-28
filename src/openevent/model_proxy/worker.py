@@ -118,9 +118,10 @@ class ModelProxyWorker:
                 item = self._observe_message(message, realtime=False, deferred_results=deferred_results)
                 if item is not None:
                     pending.append(item)
-            if not response.has_more:
-                break
-            from_seq = int(response.next_seq)
+            next_seq = int(response.next_seq)
+            if next_seq <= from_seq:
+                raise RuntimeError("Fetch did not advance next_seq during recovery")
+            from_seq = next_seq
         for deferred in deferred_results:
             if not self.store.has_result_for_request_seq(deferred.channel_id, deferred.result.prev_seq):
                 self._publish_and_record(
