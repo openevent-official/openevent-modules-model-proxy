@@ -72,7 +72,7 @@ class ModelProxyWorker:
         self.config = config
         self.openevent_client = openevent_client
         self.protocol_client = ModelProxyProtocolClient(openevent_client, config.token)
-        self.store = IdempotencyStore(config.idempotency_dsn)
+        self.store = IdempotencyStore()
         self.resolver = ChannelResolver(openevent_client, config.principal, config.token)
         self.publisher = ResultPublisher(self.protocol_client, config.principal, config.max_payload_bytes)
         provider_config = config.providers[config.default_provider]

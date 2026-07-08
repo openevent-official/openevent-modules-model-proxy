@@ -18,7 +18,6 @@ open_event:
 
 principal: 20001
 token: token-xxx
-idempotency_dsn: sqlite:///model_proxy.db
 max_payload_bytes: 16777216
 filter_response_headers: true
 
@@ -41,7 +40,6 @@ providers:
 | `open_event.addr` | 是 | OpenEvent 服务地址 |
 | `principal` | 是 | model-proxy 使用的 OpenEvent principal |
 | `token` | 是 | model-proxy 使用的 OpenEvent token |
-| `idempotency_dsn` | 否 | 本地状态 DSN，默认 `sqlite:///model_proxy.db` |
 | `max_payload_bytes` | 否 | 单条 payload 最大字节数，默认 `16777216` |
 | `filter_response_headers` | 否 | 是否在写入 `infer.result` 前过滤不重要的上游响应头，默认 `true`；设为 `false` 时保留全部上游响应头 |
 | `default_provider` | 是 | 默认 provider 名称，必须引用 `providers` 中的一项 |

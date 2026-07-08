@@ -18,7 +18,6 @@ open_event:
 
 principal: 20001
 token: token-xxx
-idempotency_dsn: sqlite:///model_proxy.db
 max_payload_bytes: 16777216
 filter_response_headers: true
 
@@ -41,7 +40,6 @@ providers:
 | `open_event.addr` | yes | OpenEvent service address |
 | `principal` | yes | OpenEvent principal used by model-proxy |
 | `token` | yes | OpenEvent token used by model-proxy |
-| `idempotency_dsn` | no | Local state DSN, default `sqlite:///model_proxy.db` |
 | `max_payload_bytes` | no | Maximum payload bytes, default `16777216` |
 | `filter_response_headers` | no | Whether to filter unimportant upstream response headers before writing `infer.result`; default `true`; set `false` to keep all upstream headers |
 | `default_provider` | yes | Default provider name, must reference an entry in `providers` |

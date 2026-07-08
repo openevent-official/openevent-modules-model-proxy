@@ -6,7 +6,6 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 
 from openevent.model_proxy.config import ModelProxyConfig, OpenEventConfig, ProviderConfig, TimeoutConfig
@@ -99,17 +98,12 @@ def _unique(prefix: str) -> str:
     return f"{prefix}-{time.time_ns()}"
 
 
-def _e2e_tmp() -> Path:
-    return Path(os.environ.get("OPENEVENT_MODEL_PROXY_E2E_TMP", "build/e2e/tmp"))
-
-
-def _config(proxy_principal: int, proxy_token: str, base_url: str, db_path: Path) -> ModelProxyConfig:
+def _config(proxy_principal: int, proxy_token: str, base_url: str) -> ModelProxyConfig:
     return ModelProxyConfig(
         protocol="llm.v1",
         open_event=OpenEventConfig(os.environ["OPENEVENT_MODEL_PROXY_E2E_TARGET"]),
         principal=proxy_principal,
         token=proxy_token,
-        idempotency_dsn=f"sqlite:///{db_path}",
         max_payload_bytes=16 * 1024 * 1024,
         default_provider="mock_llm",
         providers={
@@ -178,7 +172,6 @@ class ModelProxyE2ETests(unittest.TestCase):
                 proxy_principal=proxy_principal,
                 proxy_token=proxy_token,
                 base_url=mock_llm.base_url,
-                db_path=_e2e_tmp() / f"model-proxy-{time.time_ns()}.db",
             )
             worker = ModelProxyWorker(config, client)
             target = int(client.get_status(proxy_principal, proxy_token).max_seq)

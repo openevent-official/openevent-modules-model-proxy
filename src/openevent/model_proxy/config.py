@@ -6,7 +6,6 @@ from typing import Any
 
 
 DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
-DEFAULT_IDEMPOTENCY_DSN = "sqlite:///model_proxy.db"
 
 
 @dataclass(frozen=True)
@@ -34,7 +33,6 @@ class ModelProxyConfig:
     open_event: OpenEventConfig
     principal: int
     token: str
-    idempotency_dsn: str
     max_payload_bytes: int
     default_provider: str
     providers: dict[str, ProviderConfig]
@@ -58,7 +56,6 @@ def parse_config(data: dict[str, Any]) -> ModelProxyConfig:
     open_event = OpenEventConfig(addr=_required_str(open_event_data, "addr"))
     principal = _required_int(data, "principal")
     token = _required_str(data, "token")
-    idempotency_dsn = _optional_str(data, "idempotency_dsn", DEFAULT_IDEMPOTENCY_DSN)
     max_payload_bytes = _optional_int(data, "max_payload_bytes", DEFAULT_MAX_PAYLOAD_BYTES)
     if max_payload_bytes <= 0:
         raise ConfigError("max_payload_bytes must be positive")
@@ -73,7 +70,6 @@ def parse_config(data: dict[str, Any]) -> ModelProxyConfig:
         open_event=open_event,
         principal=principal,
         token=token,
-        idempotency_dsn=idempotency_dsn,
         max_payload_bytes=max_payload_bytes,
         default_provider=default_provider,
         providers=providers,
@@ -116,13 +112,6 @@ def _required_str(data: dict[str, Any], key: str) -> str:
     if key not in data or not isinstance(data[key], str) or not data[key]:
         raise ConfigError(f"{key} must be a non-empty string")
     return data[key]
-
-
-def _optional_str(data: dict[str, Any], key: str, default: str) -> str:
-    value = data.get(key, default)
-    if not isinstance(value, str) or not value:
-        raise ConfigError(f"{key} must be a non-empty string")
-    return value
 
 
 def _required_int(data: dict[str, Any], key: str) -> int:
