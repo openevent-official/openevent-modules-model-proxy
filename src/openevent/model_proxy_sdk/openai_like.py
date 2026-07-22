@@ -155,7 +155,6 @@ class OpenAI:
             event.get_status(
                 self._principal,
                 self._client.token,
-                timeout=_remaining(deadline),
             ).max_seq
         ) + 1
 
@@ -167,7 +166,6 @@ class OpenAI:
                     channel_id=self._channel_id,
                     payload=payload,
                     recipients=(),
-                    timeout=_remaining(deadline),
                 )
                 return int(response.seq)
             except Exception as exc:
@@ -191,7 +189,6 @@ class OpenAI:
             event.get_status(
                 self._principal,
                 self._client.token,
-                timeout=_remaining(deadline),
             ).max_seq
         )
         cursor = from_seq
@@ -203,7 +200,6 @@ class OpenAI:
                 limit=1000,
                 only_my_recipient=False,
                 channels=[self._channel_id],
-                timeout=_remaining(deadline),
             )
             for message in response.messages:
                 if int(message.seq) > reconcile_max_seq or int(message.channel_id) != self._channel_id:
@@ -243,7 +239,6 @@ class OpenAI:
                     limit=1000,
                     only_my_recipient=True,
                     channels=[self._channel_id],
-                    timeout=remaining_s,
                 )
             except Exception as exc:
                 raise _map_transport_error(exc, request_id=request_id) from exc
@@ -316,13 +311,6 @@ def _wrap(value: Any) -> Any:
 
 def _new_request_id() -> str:
     return f"req_{uuid.uuid4().hex}"
-
-
-def _remaining(deadline: float) -> float:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise APITimeoutError("OpenEvent request deadline exceeded")
-    return remaining
 
 
 def _is_guaranteed_not_committed(exc: Exception) -> bool:

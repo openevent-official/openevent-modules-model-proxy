@@ -56,9 +56,7 @@ class FakeOpenEvent:
 
 
 def _publisher(event, max_payload_bytes=4096):
-    return ResultPublisher(
-        ModelProxyProtocolClient(event, "t"), principal=1, max_payload_bytes=max_payload_bytes, rpc_timeout_s=3
-    )
+    return ResultPublisher(ModelProxyProtocolClient(event, "t"), principal=1, max_payload_bytes=max_payload_bytes)
 
 
 def _result(body=None):

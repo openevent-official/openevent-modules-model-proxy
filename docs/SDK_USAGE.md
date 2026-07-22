@@ -78,11 +78,13 @@ A timeout waiting for `infer.result` after the request seq was returned is a
 different case. The application may start a new model attempt with a new
 `request_id`; that is not a retry of the original PublishAutoSeq operation.
 
-The OpenAI-like client's `request_timeout_ms` is one total deadline covering the
-initial watermark, PublishAutoSeq, reconciliation, and result wait. `max_retries`
-only retries the same frozen request after an uncertain publish is reconciled and
-confirmed absent. Explicit authentication, permission, parameter, and payload
-failures return immediately; result-wait failures never trigger another model call.
+The OpenAI-like client's `request_timeout_ms` starts when the call begins and is
+checked between OpenEvent SDK calls while waiting for the final result. OpenEvent
+RPCs have no client-side RPC timeout, so a blocking GetStatus, PublishAutoSeq, or
+Fetch can exceed this budget. `max_retries` only retries the same frozen request
+after an uncertain publish is reconciled and confirmed absent. Explicit
+authentication, permission, parameter, and payload failures return immediately;
+result-wait failures never trigger another model call.
 
 Worker result publishing is defined only in
 [RESULT_PUBLISHING.md](RESULT_PUBLISHING.md).
@@ -111,7 +113,6 @@ seq = publish_infer_request(
             "messages": [{"role": "user", "content": "hello"}],
         },
     ),
-    timeout=30.0,
 )
 
 print(seq)

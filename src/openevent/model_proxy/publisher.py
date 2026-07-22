@@ -15,12 +15,11 @@ class ResultPublishFatal(RuntimeError):
 
 class ResultPublisher:
     def __init__(
-        self, client: ModelProxyProtocolClient, principal: int, max_payload_bytes: int, rpc_timeout_s: float | None = None
+        self, client: ModelProxyProtocolClient, principal: int, max_payload_bytes: int
     ):
         self.client = client
         self.principal = principal
         self.max_payload_bytes = max_payload_bytes
-        self.rpc_timeout_s = rpc_timeout_s
 
     def publish(self, channel_id: int, request_principal: int, result: InferResultInput) -> tuple[int, InferResultInput]:
         result = self._fit_payload(result)
@@ -31,7 +30,6 @@ class ResultPublisher:
                 principal=self.principal,
                 request_principal=request_principal,
                 req=result,
-                timeout=self.rpc_timeout_s,
             )
         except ResultPublishError as exc:
             raise ResultPublishFatal(str(exc)) from exc

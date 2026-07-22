@@ -66,10 +66,11 @@ print(resp.model_dump())
 request 已成功发布并取得 seq 后，等待 `infer.result` 超时是另一个场景。业务可以决定开始一次新的
 模型 attempt，并为新 attempt 生成新的 `request_id`；这不属于原 PublishAutoSeq 的重试。
 
-OpenAI-like 客户端的 `request_timeout_ms` 是覆盖发布前水位、PublishAutoSeq、发布对账和等待结果的
-统一总 deadline。`max_retries` 只在发布结果不确定、且完整对账确认 request 不存在后重试同一份
-冻结 request；明确的认证、权限、参数和 payload 错误立即返回，等待 result 失败也不会触发另一次
-模型调用。
+OpenAI-like 客户端的 `request_timeout_ms` 从调用开始计时，并在 OpenEvent SDK 调用返回后的检查点
+控制等待最终 result 的预算。OpenEvent RPC 不设置客户端超时，因此阻塞中的 GetStatus、
+PublishAutoSeq 或 Fetch 可能超过该预算。`max_retries` 只在发布结果不确定、且完整对账确认 request
+不存在后重试同一份冻结 request；明确的认证、权限、参数和 payload 错误立即返回，等待 result 失败
+也不会触发另一次模型调用。
 
 Worker 的 result 发布只在 [RESULT_PUBLISHING.md](RESULT_PUBLISHING.md) 中定义。
 
@@ -97,7 +98,6 @@ seq = publish_infer_request(
             "messages": [{"role": "user", "content": "hello"}],
         },
     ),
-    timeout=30.0,
 )
 
 print(seq)

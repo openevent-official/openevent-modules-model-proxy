@@ -15,7 +15,6 @@ protocol: llm.v1
 
 open_event:
   addr: 127.0.0.1:9527
-  rpc_timeout_ms: 30000
 
 worker:
   max_concurrency: 8
@@ -45,7 +44,6 @@ providers:
 |------|----------|-------------|
 | `protocol` | yes | Must be `llm.v1` |
 | `open_event.addr` | yes | OpenEvent service address |
-| `open_event.rpc_timeout_ms` | no | Per-RPC timeout in milliseconds, default `30000`; Subscribe reconnects from the last cursor after this deadline |
 | `worker.max_concurrency` | no | Maximum concurrent request tasks, default `8`; must be positive |
 | `principal` | yes | OpenEvent principal used by model-proxy |
 | `token` | yes | OpenEvent token used by model-proxy |

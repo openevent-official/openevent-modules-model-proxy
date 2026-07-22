@@ -47,15 +47,12 @@ class ModelProxyWorker:
     def __init__(self, config: ModelProxyConfig, openevent_client):
         self.config = config
         self.openevent_client = openevent_client
-        self.protocol_client = ModelProxyProtocolClient(openevent_client, config.token)
+        self.protocol_client = ModelProxyProtocolClient(self.openevent_client, config.token)
         self.store = IdempotencyStore()
-        self.rpc_timeout_s = config.open_event.rpc_timeout_ms / 1000
         self.resolver = ChannelResolver(
-            openevent_client, config.principal, config.token, config.channels, self.rpc_timeout_s
+            self.openevent_client, config.principal, config.token, config.channels
         )
-        self.publisher = ResultPublisher(
-            self.protocol_client, config.principal, config.max_payload_bytes, self.rpc_timeout_s
-        )
+        self.publisher = ResultPublisher(self.protocol_client, config.principal, config.max_payload_bytes)
         provider_config = config.providers[config.default_provider]
         self.provider = ProviderClient(provider_config)
         self._executor = ThreadPoolExecutor(
@@ -70,9 +67,7 @@ class ModelProxyWorker:
 
     def run(self) -> None:
         target = int(
-            self.openevent_client.get_status(
-                self.config.principal, self.config.token, timeout=self.rpc_timeout_s
-            ).max_seq
+            self.openevent_client.get_status(self.config.principal, self.config.token).max_seq
         )
         try:
             pending = self.recover(target)
@@ -86,7 +81,6 @@ class ModelProxyWorker:
                         self.config.token,
                         from_seq=next_seq,
                         only_my_recipient=False,
-                        timeout=self.rpc_timeout_s,
                     ):
                         if self._fatal.is_set():
                             break
@@ -116,7 +110,6 @@ class ModelProxyWorker:
                 limit=1000,
                 only_my_recipient=False,
                 channels=self.config.channels,
-                timeout=self.rpc_timeout_s,
             )
             for message in response.messages:
                 if int(message.seq) > scan_target_max_seq:
@@ -239,7 +232,7 @@ class ModelProxyWorker:
         with self._state_lock:
             futures = list(self._futures)
         if futures:
-            wait(futures, timeout=self.rpc_timeout_s)
+            wait(futures)
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _process_original(self, item: WorkItem) -> None:

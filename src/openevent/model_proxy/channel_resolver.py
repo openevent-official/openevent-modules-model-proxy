@@ -14,13 +14,11 @@ class ChannelResolver:
         principal: int,
         token: str,
         channels: tuple[int, ...],
-        rpc_timeout_s: float | None = None,
     ):
         self.openevent_client = openevent_client
         self.principal = principal
         self.token = token
         self.channels = frozenset(channels)
-        self.rpc_timeout_s = rpc_timeout_s
         self._cache = {}
 
     def is_owned_llm_channel(self, channel_id: int) -> bool:
@@ -31,9 +29,7 @@ class ChannelResolver:
         return self._cache[channel_id]
 
     def _load(self, channel_id: int) -> bool:
-        response = self.openevent_client.get_channel(
-            self.principal, self.token, channel_id, timeout=self.rpc_timeout_s
-        )
+        response = self.openevent_client.get_channel(self.principal, self.token, channel_id)
         channel = response.channel
         if channel.protocol != "llm.v1":
             self._log_ignored(channel_id, "protocol_mismatch", protocol=channel.protocol)

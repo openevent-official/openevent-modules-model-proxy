@@ -22,7 +22,6 @@ def publish_result(
     principal: int,
     request_principal: int,
     req: InferResultInput,
-    timeout: float | None,
 ) -> int:
     ts_ms = req.ts_ms or int(time.time() * 1000)
     payload = dumps_payload(result_input_to_dict(req, ts_ms=ts_ms))
@@ -40,13 +39,12 @@ def publish_result(
                     channel_id=channel_id,
                     payload=payload,
                     recipients=(request_principal,),
-                    timeout=timeout,
                 )
                 return int(response.seq)
 
             if reconcile_max_seq is None:
                 reconcile_max_seq = int(
-                    client.openevent_client.get_status(principal, client.token, timeout=timeout).max_seq
+                    client.openevent_client.get_status(principal, client.token).max_seq
                 )
             matched_seq, cursor = _scan_for_result(
                 client,
@@ -56,7 +54,6 @@ def publish_result(
                 req,
                 cursor,
                 reconcile_max_seq,
-                timeout,
             )
             if matched_seq is not None:
                 return matched_seq
@@ -82,7 +79,6 @@ def _scan_for_result(
     req: InferResultInput,
     cursor: int,
     reconcile_max_seq: int,
-    timeout: float | None,
 ) -> tuple[int | None, int]:
     while cursor <= reconcile_max_seq:
         response = client.openevent_client.fetch(
@@ -92,7 +88,6 @@ def _scan_for_result(
             limit=1000,
             only_my_recipient=False,
             channels=(channel_id,),
-            timeout=timeout,
         )
         for message in response.messages:
             if int(message.seq) > reconcile_max_seq:

@@ -15,7 +15,6 @@ protocol: llm.v1
 
 open_event:
   addr: 127.0.0.1:9527
-  rpc_timeout_ms: 30000
 
 worker:
   max_concurrency: 8
@@ -45,7 +44,6 @@ providers:
 |------|------|------|
 | `protocol` | 是 | 当前必须为 `llm.v1` |
 | `open_event.addr` | 是 | OpenEvent 服务地址 |
-| `open_event.rpc_timeout_ms` | 否 | 单次 RPC 超时毫秒数，默认 `30000`；Subscribe 到达 deadline 后从最后游标重连 |
 | `worker.max_concurrency` | 否 | 并发 request 任务上限，默认 `8`，必须为正整数 |
 | `principal` | 是 | model-proxy 使用的 OpenEvent principal |
 | `token` | 是 | model-proxy 使用的 OpenEvent token |

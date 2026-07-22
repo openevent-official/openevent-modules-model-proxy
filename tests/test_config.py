@@ -26,7 +26,6 @@ class ConfigTests(unittest.TestCase):
             }
         )
         self.assertEqual(config.max_payload_bytes, 16 * 1024 * 1024)
-        self.assertEqual(config.open_event.rpc_timeout_ms, 30000)
         self.assertEqual(config.worker.max_concurrency, 8)
         self.assertEqual(config.channels, (101, 102))
         self.assertEqual(config.providers["main"].base_url, "https://example.test")

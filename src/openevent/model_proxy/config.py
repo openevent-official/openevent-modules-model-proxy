@@ -9,7 +9,6 @@ from typing import Any
 DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 DEFAULT_ALLOWED_METHODS = frozenset({"POST"})
 DEFAULT_ALLOWED_PATHS = frozenset({"/v1/chat/completions", "/v1/responses"})
-DEFAULT_OPENEVENT_RPC_TIMEOUT_MS = 30000
 DEFAULT_MAX_CONCURRENCY = 8
 SUPPORTED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 
@@ -33,7 +32,6 @@ class ProviderConfig:
 @dataclass(frozen=True)
 class OpenEventConfig:
     addr: str
-    rpc_timeout_ms: int = DEFAULT_OPENEVENT_RPC_TIMEOUT_MS
 
 
 @dataclass(frozen=True)
@@ -70,12 +68,7 @@ def parse_config(data: dict[str, Any]) -> ModelProxyConfig:
     if protocol != "llm.v1":
         raise ConfigError("protocol must be llm.v1")
     open_event_data = _required_dict(data, "open_event")
-    open_event = OpenEventConfig(
-        addr=_required_str(open_event_data, "addr"),
-        rpc_timeout_ms=_optional_int(open_event_data, "rpc_timeout_ms", DEFAULT_OPENEVENT_RPC_TIMEOUT_MS),
-    )
-    if open_event.rpc_timeout_ms <= 0:
-        raise ConfigError("open_event.rpc_timeout_ms must be positive")
+    open_event = OpenEventConfig(addr=_required_str(open_event_data, "addr"))
     worker_data = data.get("worker", {})
     worker_data = _as_dict(worker_data, "worker")
     worker = WorkerConfig(
