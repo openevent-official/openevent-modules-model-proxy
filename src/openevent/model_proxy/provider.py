@@ -7,6 +7,7 @@ import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Any
 
 from openevent.model_proxy_sdk.model import Header
 
@@ -24,6 +25,7 @@ class ProviderHTTPResult:
 class ProviderError:
     status_code: int
     message: str
+    context: dict[str, Any] | None = None
 
 
 class ProviderClient:
@@ -31,6 +33,12 @@ class ProviderClient:
         self.config = config
 
     def call(self, method: str, path: str, body: object) -> ProviderHTTPResult | ProviderError:
+        if method not in self.config.allowed_methods or path not in self.config.allowed_paths:
+            return ProviderError(
+                60010,
+                "provider request method or path is not allowed",
+                {"method": method, "path": path},
+            )
         url = self.config.base_url + path
         payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(url=url, data=payload, method=method)

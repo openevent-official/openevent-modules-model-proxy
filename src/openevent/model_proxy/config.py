@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
+DEFAULT_ALLOWED_METHODS = frozenset({"POST"})
+DEFAULT_ALLOWED_PATHS = frozenset({"/v1/chat/completions", "/v1/responses"})
+DEFAULT_OPENEVENT_RPC_TIMEOUT_MS = 30000
+DEFAULT_MAX_CONCURRENCY = 8
+SUPPORTED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 
 
 @dataclass(frozen=True)
@@ -20,23 +26,32 @@ class ProviderConfig:
     base_url: str
     api_key: str
     timeout: TimeoutConfig
+    allowed_methods: frozenset[str] = DEFAULT_ALLOWED_METHODS
+    allowed_paths: frozenset[str] = DEFAULT_ALLOWED_PATHS
 
 
 @dataclass(frozen=True)
 class OpenEventConfig:
     addr: str
+    rpc_timeout_ms: int = DEFAULT_OPENEVENT_RPC_TIMEOUT_MS
+
+
+@dataclass(frozen=True)
+class WorkerConfig:
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
 
 
 @dataclass(frozen=True)
 class ModelProxyConfig:
     protocol: str
     open_event: OpenEventConfig
+    worker: WorkerConfig
     principal: int
     token: str
+    channels: tuple[int, ...]
     max_payload_bytes: int
     default_provider: str
     providers: dict[str, ProviderConfig]
-    filter_response_headers: bool = True
 
 
 class ConfigError(ValueError):
@@ -49,18 +64,32 @@ def load_config(path: str | Path) -> ModelProxyConfig:
 
 
 def parse_config(data: dict[str, Any]) -> ModelProxyConfig:
+    if "filter_response_headers" in data:
+        raise ConfigError("filter_response_headers is no longer supported; response headers use a fixed allowlist")
     protocol = _required_str(data, "protocol")
     if protocol != "llm.v1":
         raise ConfigError("protocol must be llm.v1")
     open_event_data = _required_dict(data, "open_event")
-    open_event = OpenEventConfig(addr=_required_str(open_event_data, "addr"))
+    open_event = OpenEventConfig(
+        addr=_required_str(open_event_data, "addr"),
+        rpc_timeout_ms=_optional_int(open_event_data, "rpc_timeout_ms", DEFAULT_OPENEVENT_RPC_TIMEOUT_MS),
+    )
+    if open_event.rpc_timeout_ms <= 0:
+        raise ConfigError("open_event.rpc_timeout_ms must be positive")
+    worker_data = data.get("worker", {})
+    worker_data = _as_dict(worker_data, "worker")
+    worker = WorkerConfig(
+        max_concurrency=_optional_int(worker_data, "max_concurrency", DEFAULT_MAX_CONCURRENCY)
+    )
+    if worker.max_concurrency <= 0:
+        raise ConfigError("worker.max_concurrency must be positive")
     principal = _required_int(data, "principal")
     token = _required_str(data, "token")
+    channels = _required_positive_int_list(data, "channels")
     max_payload_bytes = _optional_int(data, "max_payload_bytes", DEFAULT_MAX_PAYLOAD_BYTES)
     if max_payload_bytes <= 0:
         raise ConfigError("max_payload_bytes must be positive")
     default_provider = _required_str(data, "default_provider")
-    filter_response_headers = _optional_bool(data, "filter_response_headers", True)
     providers_data = _required_dict(data, "providers")
     providers = {name: _parse_provider(name, value) for name, value in providers_data.items()}
     if default_provider not in providers:
@@ -68,12 +97,13 @@ def parse_config(data: dict[str, Any]) -> ModelProxyConfig:
     return ModelProxyConfig(
         protocol=protocol,
         open_event=open_event,
+        worker=worker,
         principal=principal,
         token=token,
+        channels=channels,
         max_payload_bytes=max_payload_bytes,
         default_provider=default_provider,
         providers=providers,
-        filter_response_headers=filter_response_headers,
     )
 
 
@@ -85,6 +115,35 @@ def _parse_provider(name: str, data: Any) -> ProviderConfig:
     if provider_type != "openai_compatible":
         raise ConfigError(f"provider {name} type must be openai_compatible")
     timeout_data = _required_dict(item, "timeout")
+    allowlist = item.get("allowlist", {})
+    allowlist = _as_dict(allowlist, f"providers.{name}.allowlist")
+    allowed_methods = _optional_str_list(
+        allowlist,
+        "methods",
+        DEFAULT_ALLOWED_METHODS,
+        f"providers.{name}.allowlist.methods",
+    )
+    unsupported_methods = sorted(allowed_methods - SUPPORTED_METHODS)
+    if unsupported_methods:
+        raise ConfigError(
+            f"providers.{name}.allowlist.methods contains unsupported methods: "
+            + ", ".join(unsupported_methods)
+        )
+    allowed_paths = _optional_str_list(
+        allowlist,
+        "paths",
+        DEFAULT_ALLOWED_PATHS,
+        f"providers.{name}.allowlist.paths",
+    )
+    for path in allowed_paths:
+        if (
+            not path.startswith("/")
+            or "://" in path
+            or "?" in path
+            or "#" in path
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in path)
+        ):
+            raise ConfigError(f"providers.{name}.allowlist.paths contains invalid path: {path}")
     return ProviderConfig(
         name=name,
         type=provider_type,
@@ -93,6 +152,8 @@ def _parse_provider(name: str, data: Any) -> ProviderConfig:
         timeout=TimeoutConfig(
             total_ms=_required_positive_int(timeout_data, "total_ms"),
         ),
+        allowed_methods=allowed_methods,
+        allowed_paths=allowed_paths,
     )
 
 
@@ -134,11 +195,33 @@ def _optional_int(data: dict[str, Any], key: str, default: int) -> int:
     return value
 
 
-def _optional_bool(data: dict[str, Any], key: str, default: bool) -> bool:
-    value = data.get(key, default)
-    if not isinstance(value, bool):
-        raise ConfigError(f"{key} must be a boolean")
-    return value
+def _optional_str_list(
+    data: dict[str, Any],
+    key: str,
+    default: frozenset[str],
+    qualified_key: str,
+) -> frozenset[str]:
+    value = data.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"{qualified_key} must be a non-empty list")
+    if any(not isinstance(item, str) or not item for item in value):
+        raise ConfigError(f"{qualified_key} must contain non-empty strings")
+    if len(set(value)) != len(value):
+        raise ConfigError(f"{qualified_key} must not contain duplicates")
+    return frozenset(value)
+
+
+def _required_positive_int_list(data: dict[str, Any], key: str) -> tuple[int, ...]:
+    value = data.get(key)
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"{key} must be a non-empty list")
+    if any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in value):
+        raise ConfigError(f"{key} must contain positive integers")
+    if len(set(value)) != len(value):
+        raise ConfigError(f"{key} must not contain duplicates")
+    return tuple(value)
 
 
 def _load_simple_yaml(text: str) -> dict[str, Any]:
@@ -180,6 +263,14 @@ def _parse_minimal_yaml(text: str) -> dict[str, Any]:
 def _parse_scalar(value: str) -> Any:
     if value in {"true", "false"}:
         return value == "true"
+    if value.startswith("["):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"invalid list value: {value}") from exc
+        if not isinstance(parsed, list):
+            raise ConfigError(f"invalid list value: {value}")
+        return parsed
     try:
         return int(value)
     except ValueError:

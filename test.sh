@@ -37,16 +37,16 @@ import importlib.util
 import sys
 
 if importlib.util.find_spec("openevent.sdk") is None:
-    print("missing Python dependency in the current environment: openevent-sdk>=0.3.0", file=sys.stderr)
+    print("missing Python dependency in the current environment: openevent-sdk>=0.4.0", file=sys.stderr)
     sys.exit(2)
 try:
     version = importlib.metadata.version("openevent-sdk")
 except importlib.metadata.PackageNotFoundError:
-    print("missing Python dependency in the current environment: openevent-sdk>=0.3.0", file=sys.stderr)
+    print("missing Python dependency in the current environment: openevent-sdk>=0.4.0", file=sys.stderr)
     sys.exit(2)
 parts = tuple(int(part) for part in version.split(".")[:3] if part.isdigit())
-if parts < (0, 3, 0):
-    print(f"openevent-sdk>=0.3.0 is required, found {version}", file=sys.stderr)
+if parts < (0, 4, 0):
+    print(f"openevent-sdk>=0.4.0 is required, found {version}", file=sys.stderr)
     sys.exit(2)
 PY
 

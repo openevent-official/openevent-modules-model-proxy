@@ -7,8 +7,9 @@ from typing import Any
 
 from .client import ModelProxyProtocolClient
 from .errors import ModelProxySDKError
-from .model import InferRequestInput, InferResult
-from .openevent_io import parse_message, publish_infer_request
+from .codec import dumps_payload, request_input_to_dict
+from .model import InferRequest, InferRequestInput, InferResult
+from .openevent_io import parse_message
 
 
 class APIError(Exception):
@@ -121,18 +122,8 @@ class OpenAI:
         self.responses = _ResponsesResource(self)
 
     def _create(self, path: str, body: dict[str, Any], request_id: str | None) -> OpenAIObject:
-        explicit_request_id = request_id is not None
-        attempts = 1 if explicit_request_id else self._max_retries + 1
-        last_error: APIError | None = None
-        for _ in range(attempts):
-            current_request_id = request_id or _new_request_id()
-            try:
-                return self._create_once(path, body, current_request_id)
-            except (APIConnectionError, APITimeoutError) as exc:
-                last_error = exc
-        if last_error is not None:
-            raise last_error
-        raise APIError("request failed before it was submitted")
+        current_request_id = request_id or _new_request_id()
+        return self._create_once(path, body, current_request_id)
 
     def _create_once(self, path: str, body: dict[str, Any], request_id: str) -> OpenAIObject:
         req = InferRequestInput(
@@ -141,13 +132,14 @@ class OpenAI:
             path=path,
             body=body,
         )
+        deadline = time.monotonic() + self._request_timeout_ms / 1000
         try:
-            request_seq = publish_infer_request(self._client, self._channel_id, self._principal, req)
+            request_seq = self._publish_request(req, deadline)
         except ModelProxySDKError as exc:
             raise APIError(exc.message, request_id=request_id, provider_error=exc.to_dict()) from exc
         except Exception as exc:
             raise _map_transport_error(exc, request_id=request_id) from exc
-        result = self._wait_for_result(request_id, request_seq)
+        result = self._wait_for_result(request_id, request_seq, deadline)
         if 200 <= result.status_code <= 299:
             data = result.body if isinstance(result.body, dict) else {"data": result.body}
             response = dict(data)
@@ -155,8 +147,85 @@ class OpenAI:
             return OpenAIObject(response)
         raise _map_result_error(result)
 
-    def _wait_for_result(self, request_id: str, request_seq: int) -> InferResult:
-        deadline = time.monotonic() + self._request_timeout_ms / 1000
+    def _publish_request(self, req: InferRequestInput, deadline: float) -> int:
+        event = self._client.openevent_client
+        payload = dumps_payload(request_input_to_dict(req, ts_ms=req.ts_ms or int(time.time() * 1000)))
+        attempts = self._max_retries + 1
+        scan_from = int(
+            event.get_status(
+                self._principal,
+                self._client.token,
+                timeout=_remaining(deadline),
+            ).max_seq
+        ) + 1
+
+        for attempt in range(attempts):
+            try:
+                response = event.publish_auto_seq(
+                    principal=self._principal,
+                    token=self._client.token,
+                    channel_id=self._channel_id,
+                    payload=payload,
+                    recipients=(),
+                    timeout=_remaining(deadline),
+                )
+                return int(response.seq)
+            except Exception as exc:
+                if _is_guaranteed_not_committed(exc):
+                    raise
+                matched_seq, reconcile_max_seq = self._reconcile_request(
+                    req.request_id, payload, scan_from, deadline
+                )
+                if matched_seq is not None:
+                    return matched_seq
+                if attempt + 1 >= attempts:
+                    raise exc
+                scan_from = reconcile_max_seq + 1
+        raise APIError("request failed before it was submitted", request_id=req.request_id)
+
+    def _reconcile_request(
+        self, request_id: str, payload: bytes, from_seq: int, deadline: float
+    ) -> tuple[int | None, int]:
+        event = self._client.openevent_client
+        reconcile_max_seq = int(
+            event.get_status(
+                self._principal,
+                self._client.token,
+                timeout=_remaining(deadline),
+            ).max_seq
+        )
+        cursor = from_seq
+        while cursor <= reconcile_max_seq:
+            response = event.fetch(
+                principal=self._principal,
+                token=self._client.token,
+                from_seq=cursor,
+                limit=1000,
+                only_my_recipient=False,
+                channels=[self._channel_id],
+                timeout=_remaining(deadline),
+            )
+            for message in response.messages:
+                if int(message.seq) > reconcile_max_seq or int(message.channel_id) != self._channel_id:
+                    continue
+                if bytes(message.payload) == payload:
+                    return int(message.seq), reconcile_max_seq
+                try:
+                    parsed = parse_message(message)
+                except ModelProxySDKError:
+                    continue
+                if isinstance(parsed.payload, InferRequest) and parsed.payload.request_id == request_id:
+                    return parsed.seq, reconcile_max_seq
+            next_seq = int(response.next_seq)
+            if next_seq <= cursor:
+                raise APIConnectionError(
+                    "OpenEvent Fetch did not advance during publish reconciliation",
+                    request_id=request_id,
+                )
+            cursor = next_seq
+        return None, reconcile_max_seq
+
+    def _wait_for_result(self, request_id: str, request_seq: int, deadline: float) -> InferResult:
         from_seq = request_seq + 1
         while True:
             remaining_s = deadline - time.monotonic()
@@ -174,6 +243,7 @@ class OpenAI:
                     limit=1000,
                     only_my_recipient=True,
                     channels=[self._channel_id],
+                    timeout=remaining_s,
                 )
             except Exception as exc:
                 raise _map_transport_error(exc, request_id=request_id) from exc
@@ -246,6 +316,24 @@ def _wrap(value: Any) -> Any:
 
 def _new_request_id() -> str:
     return f"req_{uuid.uuid4().hex}"
+
+
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise APITimeoutError("OpenEvent request deadline exceeded")
+    return remaining
+
+
+def _is_guaranteed_not_committed(exc: Exception) -> bool:
+    return _grpc_code_name(exc) in {
+        "UNAUTHENTICATED",
+        "PERMISSION_DENIED",
+        "NOT_FOUND",
+        "INVALID_ARGUMENT",
+        "RESOURCE_EXHAUSTED",
+        "ABORTED",
+    }
 
 
 def _positive_int(value: Any) -> bool:

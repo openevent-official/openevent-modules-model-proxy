@@ -8,7 +8,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from openevent.model_proxy.config import ModelProxyConfig, OpenEventConfig, ProviderConfig, TimeoutConfig
+from openevent.model_proxy.config import ModelProxyConfig, OpenEventConfig, ProviderConfig, TimeoutConfig, WorkerConfig
 from openevent.model_proxy.worker import ModelProxyWorker
 from openevent.model_proxy_sdk import (
     InferRequestInput,
@@ -98,12 +98,14 @@ def _unique(prefix: str) -> str:
     return f"{prefix}-{time.time_ns()}"
 
 
-def _config(proxy_principal: int, proxy_token: str, base_url: str) -> ModelProxyConfig:
+def _config(proxy_principal: int, proxy_token: str, channel_id: int, base_url: str) -> ModelProxyConfig:
     return ModelProxyConfig(
         protocol="llm.v1",
         open_event=OpenEventConfig(os.environ["OPENEVENT_MODEL_PROXY_E2E_TARGET"]),
+        worker=WorkerConfig(),
         principal=proxy_principal,
         token=proxy_token,
+        channels=(channel_id,),
         max_payload_bytes=16 * 1024 * 1024,
         default_provider="mock_llm",
         providers={
@@ -171,6 +173,7 @@ class ModelProxyE2ETests(unittest.TestCase):
             config = _config(
                 proxy_principal=proxy_principal,
                 proxy_token=proxy_token,
+                channel_id=channel.channel_id,
                 base_url=mock_llm.base_url,
             )
             worker = ModelProxyWorker(config, client)

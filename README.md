@@ -20,10 +20,11 @@ This repository contains:
 
 - Protocol version: `llm.v1`
 - Python version: `>=3.10`
-- OpenEvent SDK: `openevent-sdk>=0.3.0`
+- OpenEvent SDK: `openevent-sdk>=0.4.0`
+- YAML parser: `PyYAML>=6.0`
 - Provider type: `openai_compatible`
-- Supported paths: `/v1/chat/completions`, `/v1/responses`, and other
-  OpenAI-compatible HTTP paths.
+- Default provider allowlist: `POST /v1/chat/completions` and
+  `POST /v1/responses`. Other methods or paths require explicit configuration.
 - Streaming response: `stream=True` is not supported yet.
 
 ## Build and Test
@@ -32,7 +33,7 @@ Build, test, and install tasks are wrapped by `make`. Wheel artifacts are
 written to `dist/`. `build/` is reserved for build dependencies, test temporary
 files, caches, and temporary files.
 
-This project depends on `openevent-sdk>=0.3.0` as a Python package. Tests use
+This project depends on `openevent-sdk>=0.4.0` as a Python package. Tests use
 the SDK package already installed in the current Python environment and do not
 install SDK from the submodule.
 
@@ -122,3 +123,4 @@ protocol SDK usage.
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md): worker configuration.
 - [docs/SDK_USAGE.md](docs/SDK_USAGE.md): Python SDK usage.
 - [docs/LLM_PROTOCOL.md](docs/LLM_PROTOCOL.md): `llm.v1` event protocol.
+- [docs/RESULT_PUBLISHING.md](docs/RESULT_PUBLISHING.md): worker result-publishing reliability.

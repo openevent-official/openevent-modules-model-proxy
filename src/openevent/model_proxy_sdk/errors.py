@@ -10,3 +10,7 @@ class ModelProxySDKError(ValueError):
 
     def to_dict(self) -> dict:
         return {"code": self.code, "message": self.message, "context": self.context}
+
+
+class ResultPublishError(RuntimeError):
+    pass

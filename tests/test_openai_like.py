@@ -27,6 +27,11 @@ class FetchResp:
 
 
 @dataclass
+class StatusResp:
+    max_seq: int
+
+
+@dataclass
 class Message:
     seq: int
     channel_id: int
@@ -42,7 +47,11 @@ class FakeOpenEvent:
         self.fetch_calls = []
         self.next_publish_seq = 10
 
-    def publish_auto_seq(self, principal, token, channel_id, payload, recipients):
+    def get_status(self, principal, token, timeout=None):
+        seqs = [item["seq"] for item in self.published]
+        return StatusResp(max(seqs, default=self.next_publish_seq - 1))
+
+    def publish_auto_seq(self, principal, token, channel_id, payload, recipients, timeout=None):
         seq = self.next_publish_seq
         self.next_publish_seq += 1
         self.published.append(
@@ -57,7 +66,7 @@ class FakeOpenEvent:
         )
         return PublishResp(seq)
 
-    def fetch(self, principal, token, from_seq, limit, only_my_recipient=False, channels=()):
+    def fetch(self, principal, token, from_seq, limit, only_my_recipient=False, channels=(), timeout=None):
         self.fetch_calls.append(
             {
                 "from_seq": from_seq,
@@ -66,12 +75,23 @@ class FakeOpenEvent:
                 "channels": tuple(channels),
             }
         )
-        matches = [item for item in self.results if item.seq >= from_seq]
+        published = [
+            Message(
+                seq=item["seq"],
+                channel_id=item["channel_id"],
+                principal=item["principal"],
+                payload=item["payload"],
+                recipients=list(item["recipients"]),
+            )
+            for item in self.published
+        ]
+        all_messages = sorted([*self.results, *published], key=lambda item: item.seq)
+        matches = [item for item in all_messages if item.seq >= from_seq]
         if channels:
             requested_channels = {int(channel) for channel in channels}
             matches = [item for item in matches if int(item.channel_id) in requested_channels]
         messages = matches[:limit]
-        last_seq = max((item.seq for item in self.results), default=0)
+        last_seq = max((item.seq for item in all_messages), default=0)
         next_seq = messages[-1].seq + 1 if len(matches) > len(messages) else last_seq + 1
         return FetchResp(messages=messages, next_seq=next_seq, last_seq=last_seq)
 
@@ -173,9 +193,11 @@ class OpenAILikeTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 429)
         self.assertEqual(ctx.exception.request_id, "req_c")
 
-    def test_auto_retry_generates_new_request_id(self):
+    def test_result_wait_transport_failure_does_not_publish_again(self):
         class FailingFetchOpenEvent(FakeOpenEvent):
-            def fetch(self, principal, token, from_seq, limit, only_my_recipient=False, channels=()):
+            def fetch(
+                self, principal, token, from_seq, limit, only_my_recipient=False, channels=(), timeout=None
+            ):
                 raise OSError("temporary")
 
         event = FailingFetchOpenEvent()
@@ -187,16 +209,62 @@ class OpenAILikeTests(unittest.TestCase):
             max_retries=1,
         )
 
-        with self.assertRaises(APIError):
+        with self.assertRaises(APIConnectionError):
             client.responses.create(model="m", input="hello", request_id="req_fixed")
         self.assertEqual(len(event.published), 1)
 
         with self.assertRaises(APIConnectionError):
             client.responses.create(model="m", input="hello")
-        self.assertEqual(len(event.published), 3)
-        payloads = [item["payload"].decode("utf-8") for item in event.published[1:]]
-        request_ids = [payload.split('"request_id":"', 1)[1].split('"', 1)[0] for payload in payloads]
-        self.assertNotEqual(request_ids[0], request_ids[1])
+        self.assertEqual(len(event.published), 2)
+
+    def test_uncertain_publish_recovers_committed_request_without_republish(self):
+        class CommitThenFailOpenEvent(FakeOpenEvent):
+            def publish_auto_seq(self, *args, **kwargs):
+                super().publish_auto_seq(*args, **kwargs)
+                raise OSError("response lost")
+
+        event = CommitThenFailOpenEvent()
+        event.results.append(_result(11, 1, "req_uncertain", 10))
+        client = OpenAI(
+            openevent_client=event,
+            openevent_token="t",
+            openevent_channel_id=1,
+            openevent_principal=10,
+            max_retries=1,
+        )
+
+        response = client.responses.create(model="m", input="hello", request_id="req_uncertain")
+
+        self.assertEqual(response.openevent_seq, 10)
+        self.assertEqual(len(event.published), 1)
+
+    def test_uncertain_publish_retries_same_frozen_request_after_absence(self):
+        class FailBeforeCommitOnceOpenEvent(FakeOpenEvent):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def publish_auto_seq(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError("connection lost before commit")
+                return super().publish_auto_seq(*args, **kwargs)
+
+        event = FailBeforeCommitOnceOpenEvent()
+        event.results.append(_result(11, 1, "req_retry", 10))
+        client = OpenAI(
+            openevent_client=event,
+            openevent_token="t",
+            openevent_channel_id=1,
+            openevent_principal=10,
+            max_retries=1,
+        )
+
+        response = client.responses.create(model="m", input="hello", request_id="req_retry")
+
+        self.assertEqual(response.openevent_seq, 10)
+        self.assertEqual(event.calls, 2)
+        self.assertEqual(len(event.published), 1)
 
 
 if __name__ == "__main__":

@@ -44,7 +44,7 @@ import sys
 
 required = {
     "grpc": "grpcio",
-    "openevent.sdk": "openevent-sdk>=0.3.0",
+    "openevent.sdk": "openevent-sdk>=0.4.0",
 }
 missing = [requirement for module, requirement in required.items() if importlib.util.find_spec(module) is None]
 if missing:
@@ -53,11 +53,11 @@ if missing:
 try:
     version = importlib.metadata.version("openevent-sdk")
 except importlib.metadata.PackageNotFoundError:
-    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.3.0", file=sys.stderr)
+    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.4.0", file=sys.stderr)
     sys.exit(2)
 parts = tuple(int(part) for part in version.split(".")[:3] if part.isdigit())
-if parts < (0, 3, 0):
-    print(f"openevent-sdk>=0.3.0 is required for e2e tests, found {version}", file=sys.stderr)
+if parts < (0, 4, 0):
+    print(f"openevent-sdk>=0.4.0 is required for e2e tests, found {version}", file=sys.stderr)
     sys.exit(2)
 PY
 

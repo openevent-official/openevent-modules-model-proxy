@@ -180,8 +180,8 @@ each result corresponds to exactly one concrete request log event.
   "status_code": 200,
   "headers": [
     {"name": "content-type", "value": "application/json"},
-    {"name": "set-cookie", "value": "a=1"},
-    {"name": "set-cookie", "value": "b=2"}
+    {"name": "x-ratelimit-policy", "value": "requests;w=60"},
+    {"name": "x-ratelimit-policy", "value": "tokens;w=60"}
   ],
   "body": {}
 }
@@ -203,9 +203,8 @@ Rules:
 - `status_code` and `body` are passed through with HTTP semantics. If there is no
   HTTP response, the proxy writes an extended `status_code`.
 - When an upstream HTTP response is received, the proxy does not rewrite the
-  upstream status code. By default it filters unimportant response headers before
-  writing to OpenEvent; this filtering can be disabled in model-proxy
-  configuration. JSON response bodies are written to `body` as JSON values.
+  upstream status code. It stores only the fixed safe response-header allowlist.
+  JSON response bodies are written to `body` as JSON values.
   Non-JSON response bodies are written according to the non-JSON response rule
   in this document.
 
@@ -213,7 +212,7 @@ Rules:
 
 - Type: `[{ "name": string, "value": string }]`.
 - Each element corresponds to one HTTP header field line. Repeated field names
-  are allowed, for example multiple `set-cookie` headers.
+  are allowed, for example multiple `x-ratelimit-policy` headers.
 - Header names are case-insensitive by HTTP standards. Stored names should be
   normalized to lower case.
 - When an HTTP response is received, filtered `headers` SHOULD be included. When
@@ -238,6 +237,8 @@ extended codes:
 - `60008`: payload exceeds the OpenEvent deployment limit.
 - `60009`: request payload is invalid and cannot be processed as a valid
   inference request.
+- `60010`: request method or path is not allowed by the selected provider
+  configuration. The proxy does not send an HTTP request in this case.
 
 When the proxy generates an extended `status_code`, `body` uses a standard error
 shape:
@@ -257,14 +258,14 @@ shape:
 - `infer.request.body` passes through according to the target model service API.
 - `infer.result.status_code` and `infer.result.body` pass through with HTTP
   semantics.
-- By default, `infer.result.headers` stores only filtered upstream HTTP response
-  headers. Configuration can disable filtering and preserve all response headers.
+- `infer.result.headers` stores only `content-type`, `retry-after`, `x-request-id`,
+  and rate-limit headers from the upstream response.
 - Connection errors, timeouts, duplicate request rejections, and other cases with
   no upstream HTTP response use extended `status_code` values and the standard
   error `body`.
 - The first version supports upstream non-JSON responses. In that case,
   `status_code` still passes through from the HTTP response, `headers` are
-  filtered according to configuration, and `body` is written as a JSON object:
+  filtered by the fixed allowlist, and `body` is written as a JSON object:
 
 ```json
 {
@@ -285,6 +286,9 @@ result with `status_code=60008`.
 - Business code MUST NOT pass provider credentials, base URLs, or provider
   selection fields through the payload. These are managed by `model-proxy`
   configuration.
+- A syntactically valid `method` and `path` are still subject to the selected
+  provider's exact method/path allowlist. Requests outside that policy receive
+  `status_code=60010` without reaching the provider.
 
 ### 6.1 Payload Size Constraints
 
@@ -313,6 +317,13 @@ business module may treat the request as timed out.
 The business module decides how to retry after a timeout. `model-proxy` rejects
 duplicate `request_id` values idempotently. If the business module needs to start
 a new model call, it should use a new `request_id`.
+
+Starting a new model call applies only after the request was successfully
+published and assigned a seq, but waiting for its result timed out. If
+PublishAutoSeq itself ends with a broken connection, deadline, or another
+uncertain outcome, the caller must first reconcile the OpenEvent log by
+`channel_id + request_id`. Retry the same publish only after confirming that the
+original request was not committed; do not immediately write a new request ID.
 
 ## 8. Versioning
 

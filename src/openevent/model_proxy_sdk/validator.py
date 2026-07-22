@@ -87,7 +87,7 @@ def validate_headers(value: Any) -> list[dict[str, str]]:
 def validate_status_code(value: Any) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise ModelProxySDKError("INVALID_PAYLOAD", "status_code must be an integer", {"status_code": value})
-    if not ((100 <= value <= 599) or (60000 <= value <= 60009)):
+    if not ((100 <= value <= 599) or (60000 <= value <= 60010)):
         raise ModelProxySDKError("INVALID_PAYLOAD", "status_code is out of range", {"status_code": value})
     return value
 

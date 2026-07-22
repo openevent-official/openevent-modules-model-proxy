@@ -3,8 +3,9 @@ from __future__ import annotations
 import time
 
 from .client import ModelProxyProtocolClient
-from .codec import dict_to_model, dumps_payload, loads_payload, request_input_to_dict, result_input_to_dict
+from .codec import dict_to_model, dumps_payload, loads_payload, request_input_to_dict
 from .model import InferRequest, InferRequestInput, InferResult, InferResultInput, ParsedMessage
+from .result_publishing import publish_result
 
 
 def parse_payload(payload: bytes) -> InferRequest | InferResult:
@@ -28,15 +29,20 @@ def publish_infer_request(
     principal: int,
     req: InferRequestInput,
     prev_seq: int | None = None,
+    timeout: float | None = None,
 ) -> int:
     ts_ms = req.ts_ms or int(time.time() * 1000)
     payload = dumps_payload(request_input_to_dict(req, ts_ms=ts_ms, prev_seq=prev_seq))
+    kwargs = {}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
     resp = client.openevent_client.publish_auto_seq(
         principal=principal,
         token=client.token,
         channel_id=channel_id,
         payload=payload,
         recipients=(),
+        **kwargs,
     )
     return int(resp.seq)
 
@@ -47,14 +53,13 @@ def publish_infer_result(
     principal: int,
     request_principal: int,
     req: InferResultInput,
+    timeout: float | None = None,
 ) -> int:
-    ts_ms = req.ts_ms or int(time.time() * 1000)
-    payload = dumps_payload(result_input_to_dict(req, ts_ms=ts_ms))
-    resp = client.openevent_client.publish_auto_seq(
-        principal=principal,
-        token=client.token,
+    return publish_result(
+        client=client,
         channel_id=channel_id,
-        payload=payload,
-        recipients=(request_principal,),
+        principal=principal,
+        request_principal=request_principal,
+        req=req,
+        timeout=timeout,
     )
-    return int(resp.seq)

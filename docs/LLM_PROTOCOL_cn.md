@@ -132,8 +132,8 @@ payload 中不得包含 `source_principal`、`provider_api_key`、`api_key` 等�
   "status_code": 200,
   "headers": [
     {"name": "content-type", "value": "application/json"},
-    {"name": "set-cookie", "value": "a=1"},
-    {"name": "set-cookie", "value": "b=2"}
+    {"name": "x-ratelimit-policy", "value": "requests;w=60"},
+    {"name": "x-ratelimit-policy", "value": "tokens;w=60"}
   ],
   "body": {}
 }
@@ -149,14 +149,13 @@ payload 中不得包含 `source_principal`、`provider_api_key`、`api_key` 等�
 - `ts_ms` 必填，Unix 毫秒时间戳（UTC）
 - 一个由 OpenEvent `seq` 唯一标识的 `infer.request` 只允许对应一个最终 `infer.result`
 - `status_code`、`body` 按 HTTP 语义透传；无 HTTP 响应时由代理写扩展 `status_code`
-- 收到上游 HTTP 响应时，代理不改写上游状态码；默认会在写入 OpenEvent 前过滤不重要的响应头，
-  也可通过 model-proxy 配置关闭过滤。JSON 响应体按 JSON 值写入
+- 收到上游 HTTP 响应时，代理不改写上游状态码，只保留固定安全 allowlist 内的响应头。JSON 响应体按 JSON 值写入
   `body`，非 JSON 响应体按本文非 JSON 响应规则写入 `body`
 
 `headers` 规则：
 
 - 类型：`[{ "name": string, "value": string }]`
-- 每个元素对应一个 HTTP 头字段行，可重复出现同名字段，例如多个 `set-cookie`
+- 每个元素对应一个 HTTP 头字段行，可重复出现同名字段，例如多个 `x-ratelimit-policy`
 - header 名按 HTTP 标准大小写不敏感，建议落盘统一为小写
 - 收到 HTTP 响应时 SHOULD 包含过滤后的 `headers`；代理自身生成扩展错误时 MUST 不包含 `headers`
 
@@ -176,6 +175,7 @@ payload 中不得包含 `source_principal`、`provider_api_key`、`api_key` 等�
 - `60007`：代理内部错误
 - `60008`：payload 超过 OpenEvent 部署上限
 - `60009`：请求 payload 非法，无法按有效推理请求处理
+- `60010`：请求 method 或 path 未被所选 provider 配置允许；proxy 不会发送 HTTP 请求
 
 代理生成扩展 `status_code` 时，`body` 使用统一错误结构：
 
@@ -193,9 +193,9 @@ payload 中不得包含 `source_principal`、`provider_api_key`、`api_key` 等�
 
 - `infer.request.body` 按目标模型服务接口协议透传
 - `infer.result.status_code` 和 `infer.result.body` 按 HTTP 语义透传
-- `infer.result.headers` 默认只写入过滤后的上游 HTTP 响应头；可通过 model-proxy 配置关闭过滤并保留全部响应头
+- `infer.result.headers` 只写入上游的 `content-type`、`retry-after`、`x-request-id` 和限流响应头
 - 连接异常、超时、重复请求拒绝等无上游 HTTP 响应场景，统一使用扩展 `status_code` 与标准错误 `body`
-- 首版支持上游非 JSON 响应；此时 `status_code` 仍按 HTTP 响应透传，`headers` 按配置过滤后写入，
+- 首版支持上游非 JSON 响应；此时 `status_code` 仍按 HTTP 响应透传，`headers` 按固定 allowlist 过滤后写入，
   `body` 写为 JSON object：
 
 ```json
@@ -212,6 +212,8 @@ payload 中不得包含 `source_principal`、`provider_api_key`、`api_key` 等�
 是上游原始响应 body bytes 的 base64 编码。代理不得截断该 JSON payload；若编码后超过
 OpenEvent payload 上限，必须写入 `status_code=60008` 的代理扩展错误 result。
 - 业务不得通过 payload 传 provider 凭据、base URL 或 provider 选择字段；这些由 `model-proxy` 配置管理
+- 语法合法的 `method` 和 `path` 仍必须通过所选 provider 的 method/path 精确
+  allowlist；不符合策略的请求不会到达 Provider，并返回 `status_code=60010`
 
 ### 6.1 Payload 大小约束
 
@@ -229,6 +231,11 @@ OpenEvent `payload` 大小建议首版部署上限为 **16 MiB**。
 正常情况下，一个 `infer.request` 对应一个 `infer.result`。若超过调用方设置的请求等待时间仍未观察到 `infer.result`，业务模块可判定该请求超时。
 
 超时后的重发策略由业务模块决定。`model-proxy` 对重复 `request_id` 执行幂等拒绝；业务模块若需要重新发起一次模型调用，应使用新的 `request_id`。
+
+这里的“重新发起模型调用”只适用于 request 已成功写入并取得 seq、但等待 result 超时的场景。
+如果 PublishAutoSeq 本身返回连接中断、deadline 或其他提交结果不确定的错误，调用方必须先按
+`channel_id + request_id` 查询 OpenEvent 日志；确认原 request 未写入后，才允许重试同一发布，
+不能直接使用新 `request_id` 再写一条 request。
 
 ## 8. 版本策略
 

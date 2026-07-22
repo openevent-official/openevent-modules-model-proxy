@@ -49,10 +49,43 @@ print(resp.model_dump())
   as `api_key` and `base_url`.
 - Provider base URL, API key, and routing are managed by `model-proxy`
   configuration.
+- The worker only forwards methods and paths allowed by the selected provider
+  configuration. The defaults cover `POST /v1/chat/completions` and
+  `POST /v1/responses`.
 - Successful response objects include an extra `openevent_seq` field.
 - `stream=True` is not supported.
 - Exception types are close to OpenAI-style errors but do not guarantee identical
   class hierarchy.
+
+### Publish Failures and Retries
+
+Publishing an `infer.request` must distinguish a confirmed non-commit from an
+uncertain outcome:
+
+- Parameter, authentication, permission, Channel, or payload errors explicitly
+  returned by OpenEvent with a non-commit guarantee are confirmed failures. Retry
+  with the same `request_id` and payload only after the cause is recoverable or
+  has been corrected, and use bounded backoff.
+- A broken connection, cancellation, `DEADLINE_EXCEEDED`, `UNKNOWN`, or
+  `UNAVAILABLE` does not prove that the message was not committed. Do not
+  immediately republish or generate a new `request_id`.
+- For an uncertain request publish, use the pre-publish watermark, GetStatus, and
+  Fetch to search by `channel_id + request_id`.
+- Reuse the original seq when a match is found. Retry the same publish only after
+  the complete reconciliation range proves that no match exists.
+
+A timeout waiting for `infer.result` after the request seq was returned is a
+different case. The application may start a new model attempt with a new
+`request_id`; that is not a retry of the original PublishAutoSeq operation.
+
+The OpenAI-like client's `request_timeout_ms` is one total deadline covering the
+initial watermark, PublishAutoSeq, reconciliation, and result wait. `max_retries`
+only retries the same frozen request after an uncertain publish is reconciled and
+confirmed absent. Explicit authentication, permission, parameter, and payload
+failures return immediately; result-wait failures never trigger another model call.
+
+Worker result publishing is defined only in
+[RESULT_PUBLISHING.md](RESULT_PUBLISHING.md).
 
 ## Protocol SDK
 
@@ -78,6 +111,7 @@ seq = publish_infer_request(
             "messages": [{"role": "user", "content": "hello"}],
         },
     ),
+    timeout=30.0,
 )
 
 print(seq)

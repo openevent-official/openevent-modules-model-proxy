@@ -1,5 +1,5 @@
 from .client import ModelProxyProtocolClient, create_client
-from .errors import ModelProxySDKError
+from .errors import ModelProxySDKError, ResultPublishError
 from .errors_payload import proxy_error_result
 from .model import (
     InferRequest,
@@ -42,6 +42,7 @@ __all__ = [
     "ParsedMessage",
     "PermissionDeniedError",
     "RateLimitError",
+    "ResultPublishError",
     "create_client",
     "parse_message",
     "parse_payload",

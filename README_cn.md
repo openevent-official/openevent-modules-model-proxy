@@ -18,9 +18,11 @@ OpenEvent channel。
 
 - 协议版本：`llm.v1`
 - Python 版本：`>=3.10`
-- OpenEvent SDK：`openevent-sdk>=0.3.0`
+- OpenEvent SDK：`openevent-sdk>=0.4.0`
+- YAML 解析：`PyYAML>=6.0`
 - Provider 类型：`openai_compatible`
-- 支持接口：`/v1/chat/completions`、`/v1/responses` 等 OpenAI-compatible HTTP 路径
+- Provider 默认 allowlist：`POST /v1/chat/completions` 和 `POST /v1/responses`；
+  其他 method 或 path 必须显式配置
 - 流式响应：暂不支持 `stream=True`
 
 ## 构建和测试
@@ -28,7 +30,7 @@ OpenEvent channel。
 构建、测试和安装统一通过 `make` 执行。最终 wheel 产物放在 `dist/`。
 `build/` 是保留的临时目录，只放构建依赖、测试临时文件、缓存和临时文件。
 
-本项目通过 Python 包依赖使用 `openevent-sdk>=0.3.0`。测试使用当前 Python 环境中
+本项目通过 Python 包依赖使用 `openevent-sdk>=0.4.0`。测试使用当前 Python 环境中
 已经安装好的 SDK 包，不会从 `openevent-sdk/` 子模块安装 SDK。
 
 正常运行、构建或安装时，请先把 SDK 安装到目标 Python 环境：
@@ -113,3 +115,4 @@ OpenAI-like 客户端和底层协议 SDK 用法见 [docs/SDK_USAGE_cn.md](docs/S
 - [docs/CONFIGURATION_cn.md](docs/CONFIGURATION_cn.md)：worker 配置文件
 - [docs/SDK_USAGE_cn.md](docs/SDK_USAGE_cn.md)：Python SDK 使用方式
 - [docs/LLM_PROTOCOL_cn.md](docs/LLM_PROTOCOL_cn.md)：`llm.v1` 事件协议
+- [docs/RESULT_PUBLISHING.md](docs/RESULT_PUBLISHING.md)：worker result 发布可靠性
