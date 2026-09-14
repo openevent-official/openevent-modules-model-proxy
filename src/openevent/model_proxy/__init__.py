@@ -1,1 +1,1 @@
-__all__ = []
+"""Worker for the llm.v1 protocol."""

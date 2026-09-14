@@ -1,46 +1,43 @@
-from __future__ import annotations
+"""Worker configuration: one strict translation of CONFIGURATION_cn.md."""
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+import unicodedata
+from urllib.parse import urlsplit
 
-
-DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
-DEFAULT_ALLOWED_METHODS = frozenset({"POST"})
-DEFAULT_ALLOWED_PATHS = frozenset({"/v1/chat/completions", "/v1/responses"})
-DEFAULT_MAX_CONCURRENCY = 8
-SUPPORTED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
-
-
-@dataclass(frozen=True)
-class TimeoutConfig:
-    total_ms: int
-
-
-@dataclass(frozen=True)
-class ProviderConfig:
-    name: str
-    type: str
-    base_url: str
-    api_key: str
-    timeout: TimeoutConfig
-    allowed_methods: frozenset[str] = DEFAULT_ALLOWED_METHODS
-    allowed_paths: frozenset[str] = DEFAULT_ALLOWED_PATHS
+import yaml
+from openevent.model_proxy_sdk.errors import ConfigurationError
 
 
 @dataclass(frozen=True)
 class OpenEventConfig:
     addr: str
+    rpc_timeout_ms: int = 30000
 
 
 @dataclass(frozen=True)
 class WorkerConfig:
-    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    max_concurrency: int = 8
+    max_retries: int = 3
+    retry_interval_ms: int = 1000
 
 
 @dataclass(frozen=True)
-class ModelProxyConfig:
+class ProviderTimeout:
+    response_header_ms: int
+    idle_ms: int = 30000
+
+
+@dataclass(frozen=True)
+class ProviderConfig:
+    type: str
+    base_url: str
+    api_key: str
+    timeout: ProviderTimeout
+
+
+@dataclass(frozen=True)
+class Config:
     protocol: str
     open_event: OpenEventConfig
     worker: WorkerConfig
@@ -52,219 +49,105 @@ class ModelProxyConfig:
     providers: dict[str, ProviderConfig]
 
 
-class ConfigError(ValueError):
+class _Loader(yaml.SafeLoader):
     pass
 
 
-def load_config(path: str | Path) -> ModelProxyConfig:
-    data = _load_simple_yaml(Path(path).read_text(encoding="utf-8"))
-    return parse_config(data)
-
-
-def parse_config(data: dict[str, Any]) -> ModelProxyConfig:
-    if "filter_response_headers" in data:
-        raise ConfigError("filter_response_headers is no longer supported; response headers use a fixed allowlist")
-    protocol = _required_str(data, "protocol")
-    if protocol != "llm.v1":
-        raise ConfigError("protocol must be llm.v1")
-    open_event_data = _required_dict(data, "open_event")
-    open_event = OpenEventConfig(addr=_required_str(open_event_data, "addr"))
-    worker_data = data.get("worker", {})
-    worker_data = _as_dict(worker_data, "worker")
-    worker = WorkerConfig(
-        max_concurrency=_optional_int(worker_data, "max_concurrency", DEFAULT_MAX_CONCURRENCY)
-    )
-    if worker.max_concurrency <= 0:
-        raise ConfigError("worker.max_concurrency must be positive")
-    principal = _required_int(data, "principal")
-    token = _required_str(data, "token")
-    channels = _required_positive_int_list(data, "channels")
-    max_payload_bytes = _optional_int(data, "max_payload_bytes", DEFAULT_MAX_PAYLOAD_BYTES)
-    if max_payload_bytes <= 0:
-        raise ConfigError("max_payload_bytes must be positive")
-    default_provider = _required_str(data, "default_provider")
-    providers_data = _required_dict(data, "providers")
-    providers = {name: _parse_provider(name, value) for name, value in providers_data.items()}
-    if default_provider not in providers:
-        raise ConfigError("default_provider must reference an existing provider")
-    return ModelProxyConfig(
-        protocol=protocol,
-        open_event=open_event,
-        worker=worker,
-        principal=principal,
-        token=token,
-        channels=channels,
-        max_payload_bytes=max_payload_bytes,
-        default_provider=default_provider,
-        providers=providers,
-    )
-
-
-def _parse_provider(name: str, data: Any) -> ProviderConfig:
-    if not isinstance(name, str) or not name:
-        raise ConfigError("provider name must be a non-empty string")
-    item = _as_dict(data, f"providers.{name}")
-    provider_type = _required_str(item, "type")
-    if provider_type != "openai_compatible":
-        raise ConfigError(f"provider {name} type must be openai_compatible")
-    timeout_data = _required_dict(item, "timeout")
-    allowlist = item.get("allowlist", {})
-    allowlist = _as_dict(allowlist, f"providers.{name}.allowlist")
-    allowed_methods = _optional_str_list(
-        allowlist,
-        "methods",
-        DEFAULT_ALLOWED_METHODS,
-        f"providers.{name}.allowlist.methods",
-    )
-    unsupported_methods = sorted(allowed_methods - SUPPORTED_METHODS)
-    if unsupported_methods:
-        raise ConfigError(
-            f"providers.{name}.allowlist.methods contains unsupported methods: "
-            + ", ".join(unsupported_methods)
-        )
-    allowed_paths = _optional_str_list(
-        allowlist,
-        "paths",
-        DEFAULT_ALLOWED_PATHS,
-        f"providers.{name}.allowlist.paths",
-    )
-    for path in allowed_paths:
-        if (
-            not path.startswith("/")
-            or "://" in path
-            or "?" in path
-            or "#" in path
-            or any(ord(ch) < 32 or ord(ch) == 127 for ch in path)
-        ):
-            raise ConfigError(f"providers.{name}.allowlist.paths contains invalid path: {path}")
-    return ProviderConfig(
-        name=name,
-        type=provider_type,
-        base_url=_required_str(item, "base_url").rstrip("/"),
-        api_key=_required_str(item, "api_key"),
-        timeout=TimeoutConfig(
-            total_ms=_required_positive_int(timeout_data, "total_ms"),
-        ),
-        allowed_methods=allowed_methods,
-        allowed_paths=allowed_paths,
-    )
-
-
-def _required_dict(data: dict[str, Any], key: str) -> dict[str, Any]:
-    if key not in data:
-        raise ConfigError(f"{key} is required")
-    return _as_dict(data[key], key)
-
-
-def _as_dict(value: Any, key: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ConfigError(f"{key} must be a mapping")
-    return value
-
-
-def _required_str(data: dict[str, Any], key: str) -> str:
-    if key not in data or not isinstance(data[key], str) or not data[key]:
-        raise ConfigError(f"{key} must be a non-empty string")
-    return data[key]
-
-
-def _required_int(data: dict[str, Any], key: str) -> int:
-    if key not in data or not isinstance(data[key], int) or isinstance(data[key], bool):
-        raise ConfigError(f"{key} must be an integer")
-    return data[key]
-
-
-def _required_positive_int(data: dict[str, Any], key: str) -> int:
-    value = _required_int(data, key)
-    if value <= 0:
-        raise ConfigError(f"{key} must be positive")
-    return value
-
-
-def _optional_int(data: dict[str, Any], key: str, default: int) -> int:
-    value = data.get(key, default)
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ConfigError(f"{key} must be an integer")
-    return value
-
-
-def _optional_str_list(
-    data: dict[str, Any],
-    key: str,
-    default: frozenset[str],
-    qualified_key: str,
-) -> frozenset[str]:
-    value = data.get(key)
-    if value is None:
-        return default
-    if not isinstance(value, list) or not value:
-        raise ConfigError(f"{qualified_key} must be a non-empty list")
-    if any(not isinstance(item, str) or not item for item in value):
-        raise ConfigError(f"{qualified_key} must contain non-empty strings")
-    if len(set(value)) != len(value):
-        raise ConfigError(f"{qualified_key} must not contain duplicates")
-    return frozenset(value)
-
-
-def _required_positive_int_list(data: dict[str, Any], key: str) -> tuple[int, ...]:
-    value = data.get(key)
-    if not isinstance(value, list) or not value:
-        raise ConfigError(f"{key} must be a non-empty list")
-    if any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in value):
-        raise ConfigError(f"{key} must contain positive integers")
-    if len(set(value)) != len(value):
-        raise ConfigError(f"{key} must not contain duplicates")
-    return tuple(value)
-
-
-def _load_simple_yaml(text: str) -> dict[str, Any]:
-    try:
-        import yaml  # type: ignore
-    except ImportError:
-        return _parse_minimal_yaml(text)
-    loaded = yaml.safe_load(text)
-    if not isinstance(loaded, dict):
-        raise ConfigError("config root must be a mapping")
-    return loaded
-
-
-def _parse_minimal_yaml(text: str) -> dict[str, Any]:
-    root: dict[str, Any] = {}
-    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
-    for raw_line in text.splitlines():
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-        indent = len(raw_line) - len(raw_line.lstrip(" "))
-        line = raw_line.strip()
-        if ":" not in line:
-            raise ConfigError(f"invalid config line: {raw_line}")
-        key, value_text = line.split(":", 1)
-        key = key.strip()
-        value_text = value_text.strip()
-        while stack and indent <= stack[-1][0]:
-            stack.pop()
-        parent = stack[-1][1]
-        if not value_text:
-            child: dict[str, Any] = {}
-            parent[key] = child
-            stack.append((indent, child))
-        else:
-            parent[key] = _parse_scalar(value_text)
-    return root
-
-
-def _parse_scalar(value: str) -> Any:
-    if value in {"true", "false"}:
-        return value == "true"
-    if value.startswith("["):
+def _mapping(loader, node):
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=True)
         try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise ConfigError(f"invalid list value: {value}") from exc
-        if not isinstance(parsed, list):
-            raise ConfigError(f"invalid list value: {value}")
-        return parsed
+            duplicate = key in result
+        except TypeError as exc:
+            raise ConfigurationError("YAML mapping keys must be strings") from exc
+        if duplicate:
+            raise ConfigurationError(f"duplicate YAML key: {key!r}")
+        result[key] = loader.construct_object(value_node, deep=True)
+    return result
+
+
+_Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _mapping)
+
+
+def _fields(value, allowed, required, location):
+    if not isinstance(value, dict):
+        raise ConfigurationError(f"{location} must be a mapping")
+    unknown = set(value) - set(allowed)
+    missing = set(required) - set(value)
+    if unknown or missing:
+        raise ConfigurationError(f"{location}: unknown fields {sorted(map(str, unknown))}; missing fields {sorted(missing)}")
+    return value
+
+
+def _integer(value, location, minimum=1):
+    if type(value) is not int or value < minimum:
+        raise ConfigurationError(f"{location} must be an integer >= {minimum}")
+    return value
+
+
+def _string(value, location, clean=False):
+    if not isinstance(value, str) or not value:
+        raise ConfigurationError(f"{location} must be a nonempty string")
+    if clean and (value != value.strip() or any(unicodedata.category(c) == "Cc" for c in value)):
+        raise ConfigurationError(f"{location} must not contain surrounding whitespace or control characters")
+    return value
+
+
+def parse_config(value):
+    """Validate a decoded YAML mapping and return the worker configuration."""
+    top = {"protocol", "open_event", "worker", "principal", "token", "channels", "max_payload_bytes", "default_provider", "providers"}
+    data = _fields(value, top, top - {"worker", "max_payload_bytes"}, "config")
+    if data["protocol"] != "llm.v1":
+        raise ConfigurationError("protocol must be llm.v1")
+    oe = _fields(data["open_event"], {"addr", "rpc_timeout_ms"}, {"addr"}, "open_event")
+    wc = _fields(data.get("worker", {}), {"max_concurrency", "max_retries", "retry_interval_ms"}, set(), "worker")
+    channels = data["channels"]
+    if not isinstance(channels, list) or not channels:
+        raise ConfigurationError("channels must be a nonempty list")
+    channels = tuple(_integer(c, "channels[]") for c in channels)
+    if len(set(channels)) != len(channels):
+        raise ConfigurationError("channels must not contain duplicates")
+    raw_providers = data["providers"]
+    if not isinstance(raw_providers, dict) or not raw_providers:
+        raise ConfigurationError("providers must be a nonempty mapping")
+    providers = {}
+    for name, raw in raw_providers.items():
+        _string(name, "provider name", clean=True)
+        p = _fields(raw, {"type", "base_url", "api_key", "timeout"}, {"type", "base_url", "api_key", "timeout"}, f"providers.{name}")
+        if p["type"] != "openai_compatible":
+            raise ConfigurationError(f"providers.{name}.type must be openai_compatible")
+        base_url = _string(p["base_url"], "base_url", clean=True)
+        try:
+            url = urlsplit(base_url)
+            valid = url.scheme in {"http", "https"} and url.hostname and url.netloc and not url.username and not url.password
+            valid = valid and "@" not in url.netloc and "?" not in base_url and "#" not in base_url
+            if url.port is not None and not 1 <= url.port <= 65535:
+                valid = False
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ConfigurationError("base_url must be an absolute HTTP(S) URL without userinfo, query or fragment")
+        timeout = _fields(p["timeout"], {"response_header_ms", "idle_ms"}, {"response_header_ms"}, "provider timeout")
+        providers[name] = ProviderConfig(
+            p["type"], base_url, _string(p["api_key"], "api_key", clean=True),
+            ProviderTimeout(_integer(timeout["response_header_ms"], "response_header_ms"), _integer(timeout.get("idle_ms", 30000), "idle_ms")),
+        )
+    default = _string(data["default_provider"], "default_provider")
+    if default not in providers:
+        raise ConfigurationError("default_provider must name a configured provider")
+    return Config(
+        "llm.v1",
+        OpenEventConfig(_string(oe["addr"], "open_event.addr"), _integer(oe.get("rpc_timeout_ms", 30000), "rpc_timeout_ms")),
+        WorkerConfig(_integer(wc.get("max_concurrency", 8), "max_concurrency"), _integer(wc.get("max_retries", 3), "max_retries", 0), _integer(wc.get("retry_interval_ms", 1000), "retry_interval_ms")),
+        _integer(data["principal"], "principal"), _string(data["token"], "token"), channels,
+        _integer(data.get("max_payload_bytes", 16777216), "max_payload_bytes", 4096), default, providers,
+    )
+
+
+def load_config(path):
     try:
-        return int(value)
-    except ValueError:
-        return value.strip('"').strip("'")
+        with Path(path).open(encoding="utf-8") as source:
+            return parse_config(yaml.load(source, Loader=_Loader))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ConfigurationError(f"cannot load configuration: {exc}") from exc
