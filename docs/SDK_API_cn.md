@@ -2,50 +2,16 @@
 
 [English version](SDK_API.md)
 
-> 状态：当前公开契约
-
-本文是 `openevent.model_proxy_sdk` 公开 Python API 的唯一权威文档。协议字段和状态机见
+本文定义 `openevent.model_proxy_sdk` 的公开 API。协议字段和状态机见
 [LLM_PROTOCOL_cn.md](LLM_PROTOCOL_cn.md)，单条消息发布结果见
-[RESULT_PUBLISHING_cn.md](RESULT_PUBLISHING_cn.md)。[SDK_USAGE_cn.md](SDK_USAGE_cn.md) 只提供使用示例。
+[RESULT_PUBLISHING_cn.md](RESULT_PUBLISHING_cn.md)，使用示例见 [SDK_USAGE_cn.md](SDK_USAGE_cn.md)。
 
 ## 1. 两层 API
 
 - 协议 SDK：构造、发布和解析五种 `llm.v1` 消息。
 - OpenAI-like 客户端：用同步的 `chat.completions.create(...)` 和 `responses.create(...)` 发起调用并等待结果。
 
-所有本模块公开类型都从 `openevent.model_proxy_sdk` 导入。
-
-```python
-from openevent.model_proxy_sdk import (
-    InferAppend,
-    InferAppendInput,
-    InferCancel,
-    InferCancelInput,
-    InferEnd,
-    InferEndInput,
-    InferRequest,
-    InferRequestInput,
-    InferResult,
-    InferResultInput,
-    ModelProxyProtocolClient,
-    OpenAI,
-    OpenAIChunk,
-    OpenAIResponse,
-    OpenAIStream,
-    ParsedMessage,
-    UNSET,
-    create_client,
-    parse_message,
-    parse_payload,
-    publish_infer_append,
-    publish_infer_cancel,
-    publish_infer_end,
-    publish_infer_request,
-    publish_infer_result,
-)
-```
-
-本 API 使用的 OpenEvent 类型从 OpenEvent SDK 的公开路径导入：
+下文的类、函数、常量和异常都从 `openevent.model_proxy_sdk` 导入；OpenEvent 类型从 SDK 导入：
 
 ```python
 from openevent.sdk import OpenEventClient, openevent_pb2
@@ -190,17 +156,13 @@ OpenAI(
 Subscribe 没有整个流的 deadline。`max_retries` 和 `retry_interval_ms` 与第 2.1 节含义相同，适用于本实例的
 普通 OpenEvent RPC 和 request、cancel 的可靠发布。
 
-构造参数缺失、值或类型不合法时抛出 `ConfigurationError`。签名之外的参数由 Python 按普通调用规则抛出
-`TypeError`；客户端不接受 `api_key`、`base_url`、外部 OpenEvent client 或外部 gRPC channel。
+构造参数缺失、值或类型不合法时抛出 `ConfigurationError`；签名之外的参数抛出 `TypeError`。
 
-`on_subscription_error` 在共享订阅的初始化、建立、读取或重连最终失败时，每个实例同步调用一次，参数是按第 5 节构造的
-`OpenEventSubscriptionError`。初始化失败包括首次 `GetStatus` 准备回放起点失败，即使此时尚未创建 Subscribe 也会通知；
-协议解析失败或请求一致性检查失败导致共享订阅最终失败时，同样通知。
-
-可重试故障尚在重试或重连期间不调用回调；遇到永久错误或用尽重试次数才算最终失败。上述订阅协议错误直接导致最终失败。
-回调用于及时通知实例已经停止接收新消息；各个调用何时抛出订阅异常，仍按第 5 节的已有输出和在途发布规则处理。
-回调抛出的异常只记录，不替换订阅错误。`OpenAI.close()` 导致的订阅错误同样按现有重试和最终失败规则处理，
-不豁免回调；回调可以关闭同一个客户端，`close()` 不等待回调退出。
+`on_subscription_error` 在共享订阅最终失败时，每个实例同步调用一次，参数为第 5 节定义的
+`OpenEventSubscriptionError`。触发条件包括首次 `GetStatus`、Subscribe 建立、读取或重连遇到永久错误或耗尽重试，
+以及消息解析或请求一致性检查失败；暂时故障仍在重试时不通知。关闭底层连接引起的故障遵循相同规则。
+回调通知实例已停止接收新消息，各调用的异常交付时机见第 5 节。回调抛错只记录，不替换订阅错误；
+回调可以关闭同一客户端，`close()` 不等待回调退出。
 
 ### 3.2 发起调用
 
@@ -214,22 +176,17 @@ client.responses.create(**kwargs)
 `prev_seq` 省略时不生成该字段。其他关键字参数组成对应的 OpenAI 请求 body。`stream=True` 返回
 `OpenAIStream`，缺失或为 `False` 时等待普通结果。
 
-首次调用先通过一次 `GetStatus` 准备消息回放起点；并发首次调用共用这次准备结果。起点准备好后，订阅连接在后台建立，
-request 发布不等待 Subscribe 接受确认；订阅断线重连期间也允许发起新调用。连接建立或恢复后，SDK 从保存的位置读回
-期间提交的 request 和模型输出。订阅已经最终失败时，按第 5 节拒绝新调用；底层连接关闭后的调用按第 4 节处理。
+首次调用通过一次逻辑 `GetStatus` 准备回放起点，并发首次调用共用结果。随后订阅在后台建立，request 发布无须等待
+Subscribe 接受或重连；连接恢复后从保存的位置补读消息。最终订阅失败和关闭后的调用分别按第 5、4 节处理。
 
 如果本地订阅读取线程创建或启动失败且线程未启动，本次调用原样抛出该异常，不发布 request，也不触发订阅错误回调；
 客户端保留首次准备前的状态，等待中的其他调用或后续调用可重新准备。
 
-发布 request 和等待模型回答是两个阶段。发布阶段只等待可靠发布 API 返回 seq 或发布错误，不等待 Worker 的输出。
-发布成功后，普通 `create()` 等待模型回答；流式 `create()` 返回 `OpenAIStream`，业务调用方通过迭代器读取输出，
-不要求返回流对象前订阅已经建立或已经收到模型响应头、正文。已经形成的订阅错误仍按第 5 节处理。
-公开返回对象的 `request_seq` 只取自可靠发布 API 的成功返回值。
+发布阶段只等待可靠发布 API 的 seq 或错误；`request_seq` 只取其成功返回值。发布成功后，普通 `create()` 等待模型回答，
+流式 `create()` 返回 `OpenAIStream`，无须等订阅建立或模型响应。已有订阅错误仍按第 5 节交付。
 
-共享订阅可以在发布 API 尚未返回时接收并暂存该调用的输出，同时继续处理其他调用的消息。这些输出供普通 `create()`
-返回回答或流式迭代使用；发布流程不读取这些输出，也不依赖它们结束。该调用在发布成功前不会向业务调用方
-交付模型结果或返回流对象；发布最终失败时，丢弃该调用暂存的输出并原样抛出 `ResultPublishError`，不因已经观察到
-request 或模型输出而改写发布结论。
+发布期间，SDK 可暂存早到输出并继续接收其他调用的消息，但只有发布成功才交付结果或返回流对象。
+发布最终失败时丢弃该调用的暂存输出，原样抛出 `ResultPublishError`；订阅消息不改变发布结论。
 
 ### 3.3 普通返回对象
 
@@ -270,12 +227,9 @@ model_dump()
 `terminal_has_body=False`、`terminal_body=None`；带有 JSON null body 的 completed end 对应
 `terminal_has_body=True`、`terminal_body=None`。其他终态不设置这两个 completed end 属性。
 
-订阅线程在发布 API 返回前接受的消息先保存在调用内部；发布成功返回流对象时，其中已经确定的属性直接可读。
-读取属性只查看 SDK 已保存的信息，不等待后续消息，也不消费输出队列。流对象返回后，已经接受的响应信息不会因业务迭代、
-关闭或订阅失败而清空，被忽略的重复消息和终态后的消息也不会覆盖它们。
-
-属性可见不表示业务已经读完输出：即使已经能读到 `terminal_body`，此前排队的 chunk 仍按顺序由迭代器返回，
-然后迭代器才结束或抛出对应异常。流失败时，已经返回的 chunk 仍然有效。
+发布完成前已收到的信息在返回流对象时直接可读。属性读取不等待消息、不消费队列；已确定的信息不会因迭代、关闭、
+订阅失败、重复消息或终态后的消息而清空或覆盖。即使 `terminal_body` 已可读，迭代器仍先按序交付排队 chunk，
+再结束或抛错；流失败时，已经返回的 chunk 仍有效。
 
 ## 4. 关闭
 
@@ -289,18 +243,13 @@ model_dump()
 也不发起其他 OpenEvent 请求。已有输出和错误继续按第 5 节交付；关闭操作本身不再次抛出订阅错误。
 已经开始的 cancel 调用按第 5 节收口，真实发布错误仍原样返回。
 
-`OpenAI.close()` 只调用实例持有的 `OpenEventClient.close()`，由 OpenEvent SDK 关闭自己的 gRPC channel；
-Model SDK 不直接操作 channel，也不维护额外的客户端关闭状态。重复关闭遵循底层 client 的幂等语义，
-关闭调用本身的耗时由底层 `OpenEventClient.close()` 决定。
+`OpenAI.close()` 调用实例持有的 `OpenEventClient.close()`，重复关闭遵循底层 client 的幂等语义，耗时由底层决定。
+它不额外等待发布、订阅线程或回调退出，也不自动取消各个流。返回时其他调用和后台任务可能仍在运行，
+已提交消息不会撤销，Worker 和 Provider 也可能继续运行。
 
-Model SDK 不额外等待发布取得最终结论、订阅读取线程或用户回调退出，不自动关闭各个流或发布 `infer.cancel`，
-也不清空结果队列、冻结接收、停止重试或构造专门的关闭异常。request 发布、Subscribe 和结果读取继续走原有链路：
-底层返回错误后，按普通 RPC 重试、可靠发布和第 5 节异常规则处理；订阅最终失败时仍进入 `FAILED`、通知回调并唤醒等待者。
-`FAILED` 的禁发规则不因调用 `close()` 改变。
-
-`close()` 返回只表示底层 client 已经关闭，不保证其他调用或后台任务已经退出，也不撤销已提交的消息或保证 Worker、Provider 停止。
-已经收到的输出、终态和错误仍按原有队列及发布结论规则交付，不因关闭而改成另一种结果。关闭后再次调用 `create()` 不会重新创建
-底层 client：已有 `FAILED` 时抛出保存的订阅错误，否则沿用原有调用链路处理底层错误。
+关闭保留已有队列、输出、终态和错误，不设置接收分界或专门的关闭异常，也不直接停止重试。底层错误继续按普通 RPC、
+可靠发布和第 5 节处理；订阅最终失败仍进入 `FAILED`、通知回调并唤醒等待者，此后的禁发规则不变。
+关闭后再次 `create()` 沿用已关闭的底层 client：已有 `FAILED` 时抛出保存的订阅错误，否则处理底层返回的错误。
 
 客户端支持上下文管理器；调用方必须显式关闭客户端或使用 `with`，不能依赖垃圾回收决定关闭时间。
 
@@ -388,34 +337,6 @@ UUID 分配、Publish 首次调用或重试、UUID 查询或重试，以及新�
 这些接收结果，发布失败仍返回原始发布错误。若错误表明该调用的 request 与冻结内容或发布返回 seq 矛盾，则该调用已暂存
 的结果不能交付，发布成功后仍以此订阅错误结束。
 
-若订阅最终失败时 request 的 UUID 仍在分配，尚未完成发布前的本地登记，则先等待 UUID 分配结束：分配失败仍返回原始
-`ResultPublishError`；分配成功也不再发布 request，直接返回保存的订阅错误。首次 `GetStatus` 最终失败时还没有 request 进入发布，
-直接返回 `OpenEventSubscriptionError`。关闭底层连接不改变这些异常选择规则。
-
-公开异常包括：
-
-```python
-from openevent.model_proxy_sdk import (
-    APIConnectionError,
-    APIError,
-    APIStatusError,
-    APITimeoutError,
-    AuthenticationError,
-    BadRequestError,
-    CommitState,
-    ConfigurationError,
-    ConflictError,
-    InternalServerError,
-    NotFoundError,
-    OpenEventSubscriptionError,
-    PayloadValidationError,
-    PermissionDeniedError,
-    ProtocolError,
-    RateLimitError,
-    ResultPublishError,
-    StreamCancelledError,
-    UnprocessableEntityError,
-)
-```
+首次 `GetStatus` 最终失败时尚未发布 request，直接返回 `OpenEventSubscriptionError`。
 
 `ResultPublishError` 和 `CommitState` 的字段与判断规则只看单条事件可靠发布契约。

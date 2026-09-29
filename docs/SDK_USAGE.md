@@ -2,10 +2,8 @@
 
 [中文版](SDK_USAGE_cn.md)
 
-See [SDK_API.md](SDK_API.md) for complete public signatures, return fields, exceptions, and
-closing semantics, and [LLM_PROTOCOL.md](LLM_PROTOCOL.md) for protocol fields.
-This document provides common usage examples only.
-See the [README build and test instructions](../README.md#build-and-test) for build artifacts, installation, and test dependencies.
+See the [README](../README.md#build-and-test) for installation and [SDK_API.md](SDK_API.md)
+for the complete API.
 
 ## 1. OpenAI-like Client
 
@@ -39,11 +37,8 @@ with OpenAI(
 `responses.create(...)` uses the same client. `provider`, `stream_id`, and `prev_seq` are
 Model Proxy control parameters; all remaining parameters form the Provider request body.
 
-An ordinary `create()` returns the model response, so it continues waiting for that response after
-request publication succeeds. The publishing phase itself does not wait for model output.
-The first call still prepares a replay position, after which the subscription connects in the
-background; publishing does not wait for subscription establishment or reconnection.
-See [SDK_API.md Section 3.2](SDK_API.md#32-starting-a-call) for preparation, publication, and return rules.
+Ordinary `create()` waits for the model response; a streaming call returns an iterator after
+request publication succeeds. See the [call rules](SDK_API.md#32-starting-a-call).
 
 ### 1.2 Streaming Calls
 
@@ -66,10 +61,8 @@ with OpenAI(
         print(event.model_dump())
 ```
 
-Request identifiers are known when `stream` is returned. Response properties update as the SDK
-accepts the corresponding messages; no iteration is required first. Even when completion information
-is already visible, previously queued chunks must still be read through iteration. See
-[SDK_API.md Section 3.4](SDK_API.md#34-streaming-return-object) for when each property becomes known.
+See [stream properties](SDK_API.md#34-streaming-return-object) for request identifiers,
+response information, and the completion body.
 
 Call `stream.close()` explicitly when stopping early. `client.close()` or a `with` block only closes
 the underlying OpenEvent client; it neither replaces individual stream cancellation nor waits for
@@ -78,6 +71,9 @@ other calls to finish. See [SDK_API.md Section 4](SDK_API.md#4-closing).
 ### 1.3 Subscription Failure Notification
 
 ```python
+from openevent.model_proxy_sdk import OpenAI
+
+
 def handle_subscription_error(error):
     print(error.reason, error.last_status)
 
@@ -95,16 +91,9 @@ finally:
     client.close()
 ```
 
-Each client instance invokes the callback once if its shared subscription finally fails during
-initialization (including the first `GetStatus`), establishment, reading, reconnection, or protocol
-validation such as message parsing. Temporary disconnections still being retried do not trigger it;
-final subscription failure caused by closing the underlying connection still does. See
-[SDK_API.md Section 3.1](SDK_API.md#31-creating-a-client).
-The subscription error describes a failure of the entire instance and contains no individual
-request identifiers; see [SDK_API.md Section 5](SDK_API.md#5-exceptions) for its fields.
-The prohibition on requests after final subscription failure and the two closing operations are
-defined in [SDK_API.md Section 4](SDK_API.md#4-closing).
-The callback may call `client.close()` on the same instance.
+Each instance invokes the callback once on final subscription failure; the callback may close
+the same client. See [client creation](SDK_API.md#31-creating-a-client) for trigger conditions
+and [exceptions](SDK_API.md#5-exceptions) for diagnostic fields and in-flight call outcomes.
 
 ## 2. Protocol SDK
 
@@ -137,8 +126,7 @@ print(seq)
 
 This function returns the request's OpenEvent seq without waiting for the model response.
 
-Use the corresponding input models and publishing functions for result, append, end, and cancel;
-the public API contract lists them all.
+See the [protocol SDK API](SDK_API.md#2-protocol-sdk) for the other input models and publishing functions.
 
 ### 2.2 Parsing Messages
 
@@ -158,6 +146,5 @@ elif isinstance(parsed.payload, InferAppend):
 print(parsed.seq, parsed.uuid, parsed.ts_ms)
 ```
 
-Catch the public `PayloadValidationError` for parsing failures and `ResultPublishError` for publishing
-failures. Do not infer whether a message was committed from exception text; use the commit state
-defined by [RESULT_PUBLISHING.md](RESULT_PUBLISHING.md).
+Parsing failures raise `PayloadValidationError`; publishing failures raise `ResultPublishError`.
+Read its [`commit_state`](RESULT_PUBLISHING.md#4-resultpublisherror) to determine the commit outcome.

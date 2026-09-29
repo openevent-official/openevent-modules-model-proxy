@@ -12,7 +12,7 @@ build:
 	PYTHON="$(PYTHON)" ./build.sh
 
 install: build
-	"$(PYTHON)" -B -m pip install $(INSTALL_ARGS) dist/openevent_model_proxy-*.whl
+	"$(PYTHON)" -B scripts/install.py $(INSTALL_ARGS)
 
 test:
 	PYTHON="$(PYTHON)" ./test.sh $(TEST_ARGS)

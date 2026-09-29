@@ -14,7 +14,7 @@ from openevent.model_proxy_sdk import (
 )
 from openevent.model_proxy_sdk.errors import PayloadValidationError, ProtocolError, ResultPublishError
 from openevent.model_proxy_sdk.publishing import _publish
-from openevent.model_proxy_sdk.rpc import call_rpc, is_retryable
+from openevent.model_proxy_sdk.rpc import RPCStopped, call_rpc, is_retryable
 
 from .provider import ProviderCall, ProviderCancelled, ProviderError
 
@@ -67,7 +67,7 @@ class Worker:
         self.stopped = threading.Event()
         self.ready = threading.Event()
         self.requests = {}
-        self.originals = {}
+        self.originals = set()
         self.pending = deque()
         self.controls = deque()
         self.running = 0
@@ -141,9 +141,16 @@ class Worker:
                       error_type=type(exc).__name__, error_code=getattr(exc, "code", None))
             raise
 
+    def _retire_locked(self, state):
+        # A running task still needs its cancellation state and abort handle.
+        # The stream-id index, rather than completed task objects, handles dedup.
+        if state.terminal_seq is not None and state.phase != "running":
+            self.requests.pop(state.request_seq, None)
+
     def _accept(self, parsed, *, historical=False, payload_bytes=0):
         payload = parsed.payload
-        body = payload.body if isinstance(payload, InferRequest) else None
+        # Parsed models own their JSON; the Worker and Provider only read it.
+        body = payload._data["body"] if isinstance(payload, InferRequest) else None
         abort = None
         with self.condition:
             if self.stopped.is_set():
@@ -156,7 +163,7 @@ class Worker:
                     parsed.channel_id, parsed.seq, parsed.principal, payload.stream_id,
                     body.get("stream", False), payload.path, duplicate=key in self.originals,
                 )
-                self.originals.setdefault(key, parsed.seq)
+                self.originals.add(key)
                 self.requests[parsed.seq] = state
                 if not historical:
                     state.provider = payload.provider or self.config.default_provider
@@ -165,9 +172,9 @@ class Worker:
                             60009 if state.provider not in self.config.providers else None)
                     if code is None:
                         state.body = body
-                        self.pending.append(state)
+                        self.pending.append(parsed.seq)
                     else:
-                        self.controls.append((state, code))
+                        self.controls.append((parsed.seq, code))
                     self.condition.notify_all()
                 self._log("request_received", state, duplicate=state.duplicate)
                 return
@@ -201,6 +208,7 @@ class Worker:
                 state.terminal_seq = parsed.seq
                 state.body = None
                 self._log("terminal_received", state, seq=parsed.seq, kind=payload.kind)
+                self._retire_locked(state)
                 self.condition.notify_all()
         if abort is not None:
             abort.abort()
@@ -252,9 +260,15 @@ class Worker:
             if len(payload) > self.config.max_payload_bytes:
                 raise ProviderError(60008, "Encoded output exceeds max_payload_bytes")
 
-        seq = _publish(self.protocol, state.channel_id, self.config.principal,
-                       event, type(event), request_principal=state.request_principal,
-                       before_publish=before_publish, validate_payload=validate_payload)
+        try:
+            seq = _publish(self.protocol, state.channel_id, self.config.principal,
+                           event, type(event), request_principal=state.request_principal,
+                           before_publish=before_publish, validate_payload=validate_payload,
+                           stop_event=self.stopped)
+        except (RPCStopped, ResultPublishError) as exc:
+            if self.stopped.is_set():
+                raise _Stopped() from exc
+            raise
         self._log("output_published", state, seq=seq, kind=event.KIND)
         return seq
 
@@ -340,6 +354,7 @@ class Worker:
                 state.phase = "done"
                 self.running -= 1
                 self._log("provider_finished", state)
+                self._retire_locked(state)
                 self.condition.notify_all()
 
     def _schedule(self):
@@ -350,15 +365,15 @@ class Worker:
                                             (self.pending and self.running < self.config.worker.max_concurrency))
                     if self.stopped.is_set():
                         return
-                    state = self.pending.popleft()
-                    if state.terminal_seq is not None:
-                        state.phase = "done"
+                    state = self.requests.get(self.pending.popleft())
+                    if state is None:
                         continue
                     state.phase = "running"
                     self.running += 1
                     self._log("provider_started", state)
                     threading.Thread(target=self._provider_task, args=(state,),
                                      name="model-proxy-provider", daemon=True).start()
+                    del state
         except Exception as exc:
             self._fail(exc)
 
@@ -369,12 +384,20 @@ class Worker:
                     self.condition.wait_for(lambda: self.stopped.is_set() or self.controls)
                     if self.stopped.is_set():
                         return
-                    state, code = self.controls.popleft()
+                    request_seq, code = self.controls.popleft()
+                    state = self.requests.get(request_seq)
+                    if state is None:
+                        continue
+                    state.phase = "running"
                 try:
                     self._error_output(state, code, rejection=True)
                 except _Stopped:
                     pass
-                state.phase = "done"
+                finally:
+                    with self.condition:
+                        state.phase = "done"
+                        self._retire_locked(state)
+                del state
         except Exception as exc:
             self._fail(exc)
 

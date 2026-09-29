@@ -174,11 +174,10 @@ class Subscription:
     def _detach_locked(self, call):
         if call.frozen is not None:
             self.calls_by_uuid.pop(call.frozen.uuid, None)
+            call.frozen = None
         if call.receive is not None:
             self.receives_by_seq.pop(call.receive.request_seq, None)
-        # Publishing owns its frozen message until it finishes; stopped readers
-        # only need the small receive state for the final request-seq check.
-        call.frozen = None
+        # Keep receive to check a publication result that arrives later.
 
     def stop_call_locked(self, call):
         call.local_closed = True
@@ -344,15 +343,17 @@ class Subscription:
                         and tuple(message.object_keys) == frozen.object_keys
                         and bytes(raw.payload) == frozen.payload
                         and (call.request_seq is None or call.request_seq == message.seq)
-                        and (call.receive is None or call.receive.request_seq == message.seq)
                     )
                     if not same:
                         error = self._request_error(call, "Subscribed request differs from frozen publication")
                         self._invalidate_locked(call, error)
                         failure = self._fail_locked(error)
-                    elif call.receive is None:
+                    else:
                         call.receive = ReceiveState(message.seq, message.seq)
                         self.receives_by_seq[message.seq] = call
+                        del self.calls_by_uuid[frozen.uuid]
+                        # Publication retries independently own this message.
+                        call.frozen = None
             else:
                 request_seq = payload.prev_seq if payload.kind == "infer.result" else payload.request_seq
                 call = self.receives_by_seq.get(request_seq)

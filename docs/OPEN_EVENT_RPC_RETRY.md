@@ -2,15 +2,11 @@
 
 [中文版](OPEN_EVENT_RPC_RETRY_cn.md)
 
-> Status: current contract
-
-This document defines common attempt counts, waiting intervals, and error classification for ordinary
-OpenEvent RPCs used by the Model Proxy Worker, protocol SDK, and OpenAI-like client. These RPCs
-include `GetStatus`, each `Fetch` page, `AllocateUuids` (the Python SDK's `get_uuid()`),
+These rules apply to the Model Proxy Worker, protocol SDK, and OpenAI-like client's
+`GetStatus`, each `Fetch` page, `AllocateUuids` (the Python SDK's `get_uuid()`),
 `GetSeqByUuid`, and establishment of one new `Subscribe`.
 
-`PublishAutoSeq` may commit a message without returning success, so it is not an ordinary RPC
-in this document. Its retries and commit state follow only the
+For `PublishAutoSeq` retries and commit states, see the
 [single-event reliable publishing contract](RESULT_PUBLISHING.md). Provider HTTP requests also
 do not use these rules.
 
@@ -20,19 +16,9 @@ Each logical operation runs once initially. After a retryable failure, it makes 
 extra attempts, waiting the fixed `retry_interval_ms` before each. The Worker reads both values from
 its YAML `worker` configuration; the protocol SDK and OpenAI-like client receive them as constructor
 arguments. Defaults and validation are defined by [Worker configuration](CONFIGURATION.md) and
-the [SDK API contract](SDK_API.md). Defaults allow at most `3` extra attempts with `1000 ms`
-between them. `max_retries=0` runs once without waiting or retrying. Each attempt still uses the
-configured per-call `rpc_timeout_ms` deadline.
-
-These counts are upper bounds. Once the high-level `OpenAI` client enters `FAILED`, it stops waiting
-to retry and must not start another RPC; the exact boundary is defined in
-[SDK_API.md Section 5](SDK_API.md#5-exceptions). The independently used protocol SDK and Worker
-are not affected by that client's state.
-
-Different logical operations have separate counters. For example, two Fetch pages, one UUID
-allocation, and one UUID lookup each have independent retry budgets. If UUID allocation succeeds
-at the server but its response is lost, another call may obtain a different UUID. UUIDs never returned
-to the upper layer may remain unused gaps; they need no reclamation and cannot be used to publish messages.
+the [SDK API contract](SDK_API.md). `max_retries=0` runs once. Each attempt uses the configured
+per-call `rpc_timeout_ms` deadline. Different logical operations have separate counters;
+each Fetch page, UUID allocation, and UUID lookup has its own budget.
 
 ## 2. Error Classification
 
@@ -43,9 +29,7 @@ The following errors are retryable:
 
 Only these errors may be retried. Every other error carrying a gRPC status finishes immediately,
 including `UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT`,
-`RESOURCE_EXHAUSTED`, and `OUT_OF_RANGE`. For example, `OUT_OF_RANGE` from a Subscribe
-position beyond the current `max_seq + 1` is a final establishment error; do not reconnect repeatedly
-with the same position.
+`RESOURCE_EXHAUSTED`, and `OUT_OF_RANGE`.
 
 Existing stop rules, such as Worker shutdown or a high-level instance entering `FAILED`, stop
 further retries. `OpenAI.close()` only closes the underlying client and does not set such a stop

@@ -10,7 +10,7 @@ from unittest.mock import patch
 import grpc
 
 from openevent.model_proxy_sdk import (
-    APIError, ConfigurationError, OpenAI,
+    APIError, ConfigurationError, OpenAI, OpenAIChunk, OpenAIResponse,
     OpenEventSubscriptionError, PayloadValidationError, ProtocolError,
     RateLimitError, ResultPublishError, StreamCancelledError,
     InferResultInput, parse_payload,
@@ -424,20 +424,51 @@ class OpenAITest(unittest.TestCase):
         self.assertEqual([chunk.body for chunk in stream], [[1, None]])
         self.assertEqual(client._subscription.receives_by_seq, {})
 
-    def test_stopped_stream_releases_request_and_preserves_received_output(self):
+    def test_ordinary_call_releases_validated_request_while_waiting_for_result(self):
+        self.server.allow_start = False
+        client = self.client()
+        published = threading.Event()
+        self.server.on_publish = lambda raw: published.set()
+        task = Task(lambda: client.responses.create(input="original"))
+        self.assertTrue(published.wait(2))
+        sub = client._subscription
+        with sub.condition:
+            call = next(iter(sub.calls_by_uuid.values()))
+            self.assertTrue(sub.condition.wait_for(lambda: call.published, timeout=2))
+            self.assertIsNotNone(call.frozen)
+            self.assertIsNone(call.receive)
+        self.server.accept()
+        self.received(client, call.request_seq)
+        self.assertIsNone(call.frozen)
+        self.assertEqual(sub.calls_by_uuid, {})
+        self.assertIs(sub.receives_by_seq[call.request_seq], call)
+        self.assertFalse(task.done.is_set())
+        self.server.on_publish = None
+        self.server.emit("result", call.stream_id, prev_seq=call.request_seq,
+                         status_code=200, body={"answer": "ready"})
+        self.assertEqual(task.join().body, {"answer": "ready"})
+
+    def test_stream_releases_validated_request_and_preserves_output_after_stop(self):
         for stop in ("terminal", "stream_close", "client_close", "subscription_failure"):
             with self.subTest(stop=stop):
+                self.server.allow_start = False
                 client = self.client()
                 try:
                     stream = client.responses.create(stream=True, input="x" * (1024 * 1024))
                     frozen = weakref.ref(stream._call.frozen)
+                    self.assertIsNotNone(frozen())
+                    self.assertIsNone(stream._call.receive)
+                    self.server.accept()
+                    self.received(client, stream.request_seq)
+                    self.assertIsNone(stream._call.frozen)
+                    self.assertEqual(client._subscription.calls_by_uuid, {})
                     head = self.result(stream)
                     append = self.server.emit(
                         "append", stream.stream_id, request_seq=stream.request_seq,
                         prev_seq=head.seq, body={"delta": "saved"},
                     )
                     self.received(client, append.seq)
-                    self.assertIsNotNone(frozen())
+                    self.assertIsNone(frozen())
                     if stop == "terminal":
                         terminal = self.end(stream, body={"done": True})
                         self.received(client, terminal.seq)
@@ -475,12 +506,17 @@ class OpenAITest(unittest.TestCase):
                 key: value for key, value in kwargs.items() if key != "token"
             })
             payload = parse_payload(request.payload)
+            self.received(client, request.seq)
+            call = client._subscription.receives_by_seq[request.seq]
+            self.assertIsNone(call.frozen)
+            self.assertEqual(client._subscription.calls_by_uuid, {})
+            self.assertFalse(call.published)
+            self.assertFalse(call.receive.terminal)
             terminal = self.server.emit(
                 "end", payload.stream_id, request_seq=request.seq,
                 status_code=200, end_status="completed", body={"done": True},
             )
             self.received(client, terminal.seq)
-            call = next(iter(client._subscription.calls))
             self.assertIsNone(call.frozen)
             self.assertEqual(call.receive.request_seq, request.seq)
             raise RpcError("UNAVAILABLE")
@@ -618,6 +654,7 @@ class OpenAITest(unittest.TestCase):
                 self.assertNotIn("provider", payload["body"])
                 self.assertNotIn("prev_seq", payload["body"])
                 self.server.emit("result", payload["stream_id"], prev_seq=raw.seq, status_code=200,
+                                 headers=[{"name": "x-request-id", "value": "original"}],
                                  body={"request_seq": "provider", "items": [{"value": raw.seq}]})
 
         self.server.on_publish = on_publish
@@ -629,12 +666,52 @@ class OpenAITest(unittest.TestCase):
         body = a.model_dump()
         body["items"].clear()
         self.assertEqual(len(a.body["items"]), 1)
+        a.body["items"][0]["value"] = "changed"
+        a.headers[0]["value"] = "changed"
+        self.assertEqual(a.items[0].value, a.request_seq)
+        self.assertEqual(a.headers, [{"name": "x-request-id", "value": "original"}])
         with self.assertRaises(AttributeError):
             a.request_seq = 5
         with self.assertRaises(AttributeError):
             a.items[0].value = 6
         self.assertEqual(self.server.status_count, 1)
         self.assertEqual(len(self.server.streams), 1)
+
+    def test_public_result_constructors_isolate_caller_owned_json(self):
+        for result_type, metadata in (
+            (OpenAIResponse, dict(stream_id="s", request_seq=1, result_openevent_seq=2, status_code=200)),
+            (OpenAIChunk, dict(append_openevent_seq=3)),
+        ):
+            with self.subTest(result_type=result_type):
+                body = {"items": [{"value": "original"}]}
+                headers = [{"name": "x-request-id", "value": "original"}]
+                if result_type is OpenAIResponse:
+                    metadata["headers"] = headers
+                result = result_type(body, **metadata)
+                body["items"][0]["value"] = "changed"
+                headers[0]["value"] = "changed"
+                result.body["items"].clear()
+                result.model_dump()["items"].clear()
+                self.assertEqual(result.items[0].value, "original")
+                if result_type is OpenAIResponse:
+                    self.assertEqual(result.headers, [{"name": "x-request-id", "value": "original"}])
+
+    def test_stream_chunk_and_terminal_json_remain_isolated(self):
+        client = self.client()
+        stream = client.responses.create(stream=True)
+        head = self.result(stream)
+        self.server.emit("append", stream.stream_id, request_seq=stream.request_seq,
+                         prev_seq=head.seq, body={"items": [{"value": "original"}]})
+        end = self.end(stream, body={"items": [{"value": "completed"}]})
+        self.received(client, end.seq)
+        chunk = next(stream)
+        chunk.body["items"][0]["value"] = "changed"
+        chunk.model_dump()["items"].clear()
+        stream.terminal_body["items"].clear()
+        self.assertEqual(chunk.items[0].value, "original")
+        self.assertEqual(stream.terminal_body, {"items": [{"value": "completed"}]})
+        self.assertEqual(list(stream), [])
+        self.assertEqual(chunk.model_dump(), {"items": [{"value": "original"}]})
 
     def test_stream_http_error_waits_for_end_and_preserves_provider_body(self):
         client = self.client()
@@ -913,6 +990,10 @@ class OpenAITest(unittest.TestCase):
 
         def on_publish(raw):
             payload = json.loads(raw.payload)
+            self.received(client, raw.seq)
+            call = client._subscription.receives_by_seq[raw.seq]
+            self.assertIsNone(call.frozen)
+            self.assertEqual(client._subscription.calls_by_uuid, {})
             result = self.server.emit("result", payload["stream_id"], prev_seq=raw.seq,
                                       status_code=200, body="wrong")
             self.received(client, result.seq)

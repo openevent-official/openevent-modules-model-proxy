@@ -152,8 +152,8 @@ class EndToEndTests(unittest.TestCase):
 
         eventually(ready)
         cls.caller, cls.proxy = 101, 201
-        cls.caller_token = cls.admin.add_token(cls.caller).binding.token
-        cls.proxy_token = cls.admin.add_token(cls.proxy).binding.token
+        cls.caller_token = cls.admin.add_token(cls.caller).token
+        cls.proxy_token = cls.admin.add_token(cls.proxy).token
         cls.transport = OpenEventClient(cls.event_addr, timeout_ms=1000)
         cls.addClassCleanup(cls.transport.close)
         cls.protocol = create_client(cls.transport, cls.caller_token, max_retries=1, retry_interval_ms=10)
@@ -408,7 +408,7 @@ class EndToEndTests(unittest.TestCase):
         stream = client.responses.create(stream=True, test_mode="hold")
         next(stream)
         other_principal = 301
-        other_token = self.admin.add_token(other_principal).binding.token
+        other_token = self.admin.add_token(other_principal).token
         self.transport.add_member(self.caller, self.caller_token, self.channel, other_principal)
         other = create_client(self.transport, other_token, max_retries=0)
         publish_infer_cancel(other, self.channel, other_principal, InferCancelInput(

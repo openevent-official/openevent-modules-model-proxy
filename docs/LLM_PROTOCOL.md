@@ -2,9 +2,6 @@
 
 [中文版](LLM_PROTOCOL_cn.md)
 
-> Status: current effective specification
-> Scope: model-proxy payloads and conventions for OpenEvent channels with `protocol="llm.v1"`
-
 ## 1. Boundaries
 
 `llm.v1` defines messages between business callers, `model-proxy`, and result consumers. OpenEvent
@@ -27,7 +24,7 @@ Its description is a JSON string with this shape:
 The decoded description must be a JSON object containing exactly the three required fields
 `version`, `updated_at_ms`, and `metadata`. `version` must be the string `"v1"`; `updated_at_ms`
 must be a nonnegative integer, with `bool` excluded; `metadata` must be a JSON object whose
-contents are application-defined. JSON field order and insignificant whitespace do not affect validity.
+contents are application-defined.
 
 A Channel is one Model Proxy session domain, bound by deployment configuration to exactly one
 running Worker. Both callers and the Worker must be members. A request has an empty OpenEvent
@@ -63,8 +60,6 @@ it is listed as required or optional for that message kind.
 | `end_status` | string; only `completed`, `failed`, or `interrupted` |
 | `body` | must be an object in `infer.request`; allowed JSON types and omission rules for other messages are listed below |
 
-The five message kinds allow the following fields. Any field not listed as required or optional is invalid.
-
 | `kind` | Required fields | Optional fields | `body` rule |
 | --- | --- | --- | --- |
 | `infer.request` | `kind`, `stream_id`, `ts_ms`, `method`, `path`, `body` | `provider`, `prev_seq` | Must be an object; `stream`, when present, must be boolean |
@@ -85,10 +80,7 @@ of the outer OpenEvent `EventMessage.ts_ms`; the two need not be equal. The oute
 server received the publish request, as defined by the
 [OpenEvent API contract](../openevent-sdk/docs/API.md#1-basic-conventions).
 
-Payloads contain no principal, token, provider credentials, or base URL. An `infer.request` may include
-an optional top-level `provider` name to select a provider from the Worker's configuration. This name
-is outside `body` and is not forwarded to the provider. `body` is provider-defined JSON; other fields
-are passed through according to the rules.
+Payloads contain no principal, token, provider credentials, or base URL.
 
 ## 4. infer.request
 
@@ -115,15 +107,6 @@ request fields pass through unchanged for validation by the selected provider. A
 a non-object body, or a non-boolean `stream` fails strict parsing and causes the Worker to exit with
 an error under Section 3.
 
-Both ordinary and streaming calls begin with `infer.request`; there is no separate streaming request
-kind. After obtaining Provider HTTP response headers that can be recorded, a streaming call first
-publishes an `infer.result` without `body` to carry the HTTP status and response headers. If the call
-fails before that result is written, it publishes `infer.end` directly without adding a result merely
-to establish an output chain.
-
-The OpenEvent `principal` is the caller, and `recipients` MUST be empty. The publisher must provide
-`stream_id`.
-
 A request's `prev_seq` is optional. When present, it must be a positive OpenEvent seq. Its application
 meaning is outside this protocol, and it does not participate in the output chain.
 
@@ -140,8 +123,7 @@ produces no result, and does not enter the `stream_id` deduplication state.
 
 ### 4.1 Minimum `openai_compatible` Contract
 
-`openai_compatible` means that Model Proxy can complete an HTTP call under the following rules. It
-does not require a Provider to implement all OpenAI product models, fields, or business capabilities:
+An `openai_compatible` Provider must satisfy these rules:
 
 1. The Provider accepts JSON object requests at `POST /v1/chat/completions` and `POST /v1/responses`.
    Model Proxy forwards the request `body` unchanged; it does not validate model names, message contents,
@@ -161,21 +143,15 @@ does not require a Provider to implement all OpenAI product models, fields, or b
 
 See [CONFIGURATION.md](CONFIGURATION.md) for supported HTTP response compression.
 
-This is the full compatibility scope on which Model Proxy depends. Providers own the business meaning
-of request fields and returned JSON. Responses that violate these transport or terminal rules are handled
+Providers own the business meaning of request fields and returned JSON. Responses that violate these rules are handled
 as Provider parsing failures or call interruptions.
 
 ## 5. infer.result
 
-A request may have multiple `infer.result` messages. Consumers treat an unparseable `llm.v1` message as
-a protocol error; they cannot skip it and keep looking for a later result. Before the request is terminal,
-the consumer accepts the first result whose `stream_id` and `prev_seq` match that request, and ignores
-all later matching results. It cannot skip the first result to choose a later, more suitable one. A first
-result containing `body` is an ordinary terminal event, including rejections of duplicate or invalid
-requests whose original body specified `stream=true`. A first result without `body` establishes the
-streaming output chain. If the first result's shape is invalid for that call, the call reports a protocol
-error. A result's `prev_seq` points directly to the request, although unrelated messages may occur
-between their global OpenEvent seq values. A result containing `body` is an ordinary terminal event:
+Before the request is terminal, the consumer accepts the first result whose `stream_id` and `prev_seq`
+match that request, and ignores later matching results. An unparseable message reports a protocol error;
+an invalid first result reports a protocol error for that call. Neither can be skipped in favor of a later result.
+A result containing `body` is an ordinary terminal event:
 
 ```json
 {
@@ -235,8 +211,7 @@ request determines the result shape:
    even when the original payload has `stream=true`. No append/end follows that result. If a valid cancel
    commits first, the terminal resolution rules in Section 6 apply.
 
-Section 3 defines the complete result field set and types. Payload parsing itself does not read history;
-the Worker or consumer state machine checks that a result's shape agrees with its request.
+The Worker or consumer state machine checks the result shape against its request.
 
 ### 5.1 Provider Failure Mapping for Ordinary Calls
 
@@ -273,13 +248,7 @@ candidate terminal events and output messages cannot change the outcome.
 
 An `infer.append` cannot follow the request directly. Receiving an append before accepting a bodyless
 result must report a protocol error only for that call; the consumer cannot use it to establish the chain.
-`stream_id` is a caller-generated string identifying one model call, used by both ordinary and streaming
-calls. `request_seq` is not another random identifier: it is the OpenEvent `seq` assigned to the
-`infer.request` that started this call. Later duplicate requests may use the same `stream_id`, so append,
-end, and cancel must also carry `request_seq` to identify exactly which request event they belong to or
-terminate. `request_seq` is known when request publication succeeds, so end or cancel may be sent before
-result. Result does not repeat `request_seq`; instead, its `prev_seq` equals the target request's
-`request_seq`.
+After request publication succeeds, end or cancel may be sent before result.
 
 ### 6.1 infer.append
 
@@ -356,11 +325,8 @@ Provider terminal events become `infer.end` directly and are never first publish
 Normal Responses completion has the same shape, except `end_status="completed"` and
 `body.type="response.completed"`.
 
-`response.incomplete` means that the Provider finished this generation without producing a complete
-answer, for example because the output token limit was reached. It uses the failed end shape above,
-with `body.type` still set to `response.incomplete` and the entire original event, including
-`response.incomplete_details`, preserved. `status_code` retains the actual HTTP status; even HTTP 200
-is treated as terminal failure. Previously published appends remain valid.
+`response.incomplete` also uses the failed end shape, preserving the entire original event, including
+`response.incomplete_details`. Previously published appends remain valid.
 
 `request_seq` equals the request seq, and `stream_id` must match that request. End does not identify
 which append it follows. It identifies the stream by `request_seq` and participates in terminal resolution
@@ -381,24 +347,18 @@ using its own OpenEvent seq. `end_status` is exactly `completed`, `failed`, or `
   `status_code` is a Model Proxy extension code and `body` is the standard Model Proxy error object.
   Existing appends remain valid and consumers MUST retain them.
 
-Failed and interrupted ends must contain `body`; no end may contain `headers`. The Worker checks
-endpoint-specific completed-body rules against the corresponding request. Parsing one end payload alone
-cannot determine the endpoint from that payload.
+The Worker checks endpoint-specific completed-body rules against the corresponding request.
 
 Completed and failed ends must use a Provider HTTP `status_code` in `100..599`. Interrupted ends may use
 only `60000`, `60001`, `60002`, `60003`, `60007`, or `60008`.
 
-The Worker maps the Provider terminal markers in Section 4.1 to completed or failed ends. A Responses
-terminal failure is a model outcome, not a transport interruption, even with HTTP status 200. A clean EOF
+A clean EOF
 before the applicable terminal marker means the Provider stream is incomplete and produces an interrupted
 end. Invalid stream events/JSON, Provider connection or stream-idle timeouts, connection resets, and Worker
 restarts before a terminal event is persisted also produce interrupted ends.
 
-The stream ends at the first accepted result containing `body`, end, or cancel in OpenEvent seq order.
-All subsequent results, appends, ends, and cancels are ignored, including publications already in flight
-when the terminal event committed but persisted afterward. End does not reference the last append, so
-an in-flight append committed after end is simply ignored under the terminal rules; it does not break
-an end chain. Closing a local reader or interrupting Subscribe is not a protocol terminal event.
+In-flight output committed after the terminal event is also ignored. Closing a local reader or
+interrupting Subscribe is not a protocol terminal event.
 
 ### 6.3 infer.cancel
 
@@ -420,9 +380,7 @@ For a stream that is not yet terminal, cancel itself is the `60004 / STREAM_CANC
 no following `infer.end` is required. After observing a winning cancel, the Worker initiates no new output
 publication. Outputs already in flight that commit later are ignored under the terminal rules. A cancel
 is ignored if its target `request_seq` does not exist, its `stream_id` does not match, or the call is already
-terminal. Of multiple cancels for one call, only the one with the smallest OpenEvent seq is accepted.
-Results containing `body`, ends, and cancels likewise compete as candidate terminal events, with the
-earliest valid candidate in seq order accepted.
+terminal.
 
 ## 7. Model Proxy Extension Status Codes
 
@@ -446,9 +404,6 @@ sending the request, or waiting for response headers. Use `60001`, `60002`, or `
 DNS, TLS, or connection failure is observed before that budget expires. After response headers arrive,
 read-idle timeouts use `60000` and explicit connection resets use `60003`. Do not infer an error code from
 the current phase after the deadline has expired.
-
-`infer.cancel` itself represents `60004 / STREAM_CANCELLED`. It carries no error body and requires no
-`infer.end` to represent cancellation.
 
 Error results/ends generated by the Worker using a Model Proxy extension status code use the following
 standard error body. `error.code` must correspond to `status_code`:
@@ -474,11 +429,6 @@ returned by the Provider follow Sections 5 and 6; restart recovery follows Secti
 1. If the bodyless result has not been written, do not add one.
 2. If the bodyless result has already been written, retain its Provider HTTP status and all previously
    published appends. The end records the interruption reason without rewriting existing output.
-
-For example, Provider HTTP 200 followed by a connection reset produces `result.status_code=200` and
-`end.status_code=60003`. A timeout before the provider returns headers produces only
-`end.status_code=60000`; oversized retained response headers produce only `end.status_code=60008`.
-Callers do not need to guess whether the failure occurred before or after the output chain was established.
 
 ## 8. Payload Size and Restart Outcomes
 
@@ -520,5 +470,3 @@ an ordinary terminal `60007` result regardless of whether `body.stream` is `true
 to that duplicate request's own seq. Recovery states only that the previous processing left no terminal
 event. It does not guess whether the Worker would have published `60005`, `60008`, `60009`, or a Provider
 terminal event before stopping, and does not reinterpret old requests using new Provider configuration.
-
-This document is the sole current `llm.v1` contract. It retains no compatibility rules from earlier drafts.

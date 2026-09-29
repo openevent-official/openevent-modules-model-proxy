@@ -55,6 +55,14 @@ class _JSONResult:
         object.__setattr__(self, "_body", deepcopy(body))
         object.__setattr__(self, "_metadata", deepcopy(metadata))
 
+    @classmethod
+    def _from_model(cls, model, **metadata):
+        # Protocol models already own their JSON and never mutate it.
+        result = object.__new__(cls)
+        object.__setattr__(result, "_body", model._data["body"])
+        object.__setattr__(result, "_metadata", metadata)
+        return result
+
     def __setattr__(self, name, value):
         raise AttributeError("Response objects are read-only")
 
@@ -136,13 +144,13 @@ class OpenAIStream:
                     raise self._owner._protocol_error(self._call, message)
                 payload = message.payload
                 if payload.kind == "infer.append":
-                    return OpenAIChunk(payload.body, append_openevent_seq=message.seq)
+                    return OpenAIChunk._from_model(payload, append_openevent_seq=message.seq)
                 if payload.kind == "infer.result" and not payload.has_body:
                     continue
                 context = self._owner._context(self._call, last_seq=message.seq)
                 if payload.kind == "infer.cancel":
                     raise StreamCancelledError("Stream cancelled", status_code=60004, **context)
-                context["body"] = payload.body if payload.has_body else None
+                context["body"] = payload._data.get("body")
                 error = make_api_error(
                     payload.status_code,
                     end_status=payload.end_status if payload.kind == "infer.end" else None,
@@ -216,7 +224,9 @@ class OpenAI:
             method="POST", path=path, body=kwargs,
             provider=provider, prev_seq=prev_seq,
         )
-        streaming = request.body.get("stream", False)
+        # The input owns its snapshot; the endpoint shares this kwargs dict.
+        kwargs.clear()
+        streaming = request._data["body"].get("stream", False)
         sub = self._subscription
         sub.prepare()
         call = sub.begin(request.stream_id, streaming)
@@ -233,6 +243,7 @@ class OpenAI:
         except BaseException:
             sub.publication_failed(call)
             raise
+        del request
         if streaming:
             sub.check_stream_return(call)
             return OpenAIStream(self, call)
@@ -240,11 +251,11 @@ class OpenAI:
         if isinstance(message, ProtocolFault):
             raise self._protocol_error(call, message)
         payload = message.payload
-        error = make_api_error(payload.status_code, body=payload.body, **self._context(call))
+        error = make_api_error(payload.status_code, body=payload._data["body"], **self._context(call))
         if error is not None:
             raise error
-        return OpenAIResponse(
-            payload.body, stream_id=call.stream_id, request_seq=call.request_seq,
+        return OpenAIResponse._from_model(
+            payload, stream_id=call.stream_id, request_seq=call.request_seq,
             result_openevent_seq=message.seq, status_code=payload.status_code, headers=payload.headers,
         )
 

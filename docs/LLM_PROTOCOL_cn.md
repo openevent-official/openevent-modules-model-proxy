@@ -2,9 +2,6 @@
 
 [English version](LLM_PROTOCOL.md)
 
-> 状态：当前有效规格
-> 适用范围：OpenEvent `protocol="llm.v1"` channel 的模型代理 payload 与约定
-
 ## 1. 边界
 
 `llm.v1` 定义业务调用方、`model-proxy` 和结果消费者之间的消息。OpenEvent
@@ -25,7 +22,7 @@ visibility。description 是如下形状的 JSON 字符串：
 
 description 解码后必须是 JSON object，并且只能包含 `version`、`updated_at_ms`、`metadata`
 三个必填字段。`version` 必须是字符串 `"v1"`；`updated_at_ms` 必须是非负整数，`bool` 不算整数；
-`metadata` 必须是 JSON object，内部内容由应用决定。JSON 字段顺序和无意义空白不影响合法性。
+`metadata` 必须是 JSON object，内部内容由应用决定。
 
 一个 Channel 是一个 Model Proxy 会话域，由部署配置绑定到且只能绑定到一个运行中的 Worker。
 调用方和 Worker 必须都是成员。request 的 OpenEvent `recipients` 为空；Worker 输出消息定向给
@@ -59,8 +56,6 @@ OpenEvent 顶层字段保持原生语义：
 | `end_status` | string；只能是 `completed`、`failed` 或 `interrupted` |
 | `body` | `infer.request` 中必须是 object；其他消息中的具体 JSON 类型和是否允许省略见下表 |
 
-五种消息允许的字段如下。标为必填或可选之外的字段一律非法。
-
 | `kind` | 必填字段 | 可选字段 | `body` 规则 |
 | --- | --- | --- | --- |
 | `infer.request` | `kind`、`stream_id`、`ts_ms`、`method`、`path`、`body` | `provider`、`prev_seq` | 必须是 object；`stream` 存在时必须是 boolean |
@@ -77,10 +72,7 @@ OpenEvent 顶层字段保持原生语义：
 payload 中的 `ts_ms` 与 OpenEvent 外层 `EventMessage.ts_ms` 相互独立，不要求相等。外层时间表示服务端
 收到发布请求的时间，语义以[OpenEvent API 契约](../openevent-sdk/docs/API_cn.md#1-基础约定)为准。
 
-payload 不包含 principal、token、provider 凭据或 base URL。`infer.request`
-可以带一个可选的顶层 `provider` 名称，用来选择 worker 配置中的 provider；
-这个名称不属于 `body`，也不会转发给 provider。`body` 是 provider 定义的
-JSON 值，其他字段按规则透传。
+payload 不包含 principal、token、provider 凭据或 base URL。
 
 ## 4. infer.request
 
@@ -104,12 +96,6 @@ result。`provider` 不会放进转发给 Provider 的 `body`。`body` 必须是
 其他 OpenAI 请求字段原样透传并由选中的 provider 校验。其他 method/path、非 object body 或非 boolean
 `stream` 都会导致严格解析失败，Worker 按第 3 节报错退出。
 
-普通调用和流式调用都只由 `infer.request` 发起，没有单独的流式请求 kind。流式请求取得可记录的 provider
-HTTP 响应头后，先写不带 `body` 的 `infer.result`，用来承载 HTTP 状态和响应头；如果在它写入前调用已经
-失败，则直接写 `infer.end`，不为了建立流链而补一条 result。
-
-OpenEvent `principal` 是调用方，`recipients` MUST 为空。发布方必须提供 `stream_id`。
-
 request 的 `prev_seq` 可选；存在时必须是正数 OpenEvent seq，其应用含义不属于本协议，
 也不参与输出流单链。
 
@@ -123,8 +109,7 @@ request 声明 `body.stream=true`，先提交的合法 cancel 仍可按第 6 节
 
 ### 4.1 `openai_compatible` 的最小兼容契约
 
-`openai_compatible` 表示 Model Proxy 能按下面这些规则完成一次 HTTP 调用，不表示 Provider 必须实现 OpenAI
-产品的所有模型、字段或业务能力：
+`openai_compatible` Provider 必须满足以下规则：
 
 1. Provider 接受 JSON object 形式的 `POST /v1/chat/completions` 和 `POST /v1/responses` 请求；Model Proxy
    原样转发 request 的 `body`，不会替 Provider 校验模型名、消息内容或其他业务字段。
@@ -141,17 +126,13 @@ request 声明 `body.stream=true`，先提交的合法 cancel 仍可按第 6 节
 
 HTTP 响应压缩的支持范围见 [CONFIGURATION_cn.md](CONFIGURATION_cn.md)。
 
-以上就是 Model Proxy 依赖的兼容范围。Provider 对请求字段和返回 JSON 的业务语义负责；不满足上述传输与终态
-规则的响应按 Provider 解析失败或调用中断处理。
+Provider 对请求字段和返回 JSON 的业务语义负责；不满足上述规则的响应按 Provider 解析失败或调用中断处理。
 
 ## 5. infer.result
 
-同一个 request 可以出现多条 `infer.result`。消费者遇到无法解析的 `llm.v1` 消息时按协议错误处理，不能跳过它继续找后续
-result。request 尚未终态时，消费者接受第一条 `stream_id`、`prev_seq` 与该 request 匹配的 result，后面的匹配 result
-全部忽略；不能跳过第一条，再选择更合意的后续 result。第一条带 `body` 的 result
-是普通终态，包括原 request body 写了 `stream=true`、但因重复或非法而返回的拒绝结果；第一条不带 `body` 的 result
-建立流式输出链。如果第一条 result 的形态对该任务不合法，该任务报告协议错误。result 的 `prev_seq` 直接指向 request，
-但两者的 OpenEvent 全局 seq 之间可以穿插其他消息。带 `body` 的 result 是普通终态：
+request 尚未终态时，消费者接受第一条 `stream_id`、`prev_seq` 与该 request 匹配的 result，忽略后续匹配 result。
+无法解析消息时报告协议错误；首条 result 的形态不合法时向该任务报告协议错误，均不能跳过它选择后续 result。
+带 `body` 的 result 是普通终态：
 
 ```json
 {
@@ -204,8 +185,7 @@ result 由 Worker principal 发布，且只把 request principal 放入 recipien
    生成拒绝结果时，固定使用带错误 body 的普通终态 result，即使原 payload 中 `stream=true`；这种结果之后不再发布
    append/end。若合法 cancel 先提交，则按第 6 节的终态裁决处理。
 
-result 的完整字段集合和类型见第 3 节。payload 解析本身不读取历史；result 形态是否与 request 一致由
-Worker 或消费者状态机校验。
+Worker 或消费者状态机根据 request 校验 result 形态。
 
 ### 5.1 普通调用的 Provider 失败映射
 
@@ -236,11 +216,7 @@ Channel 成员发布的 `infer.cancel`。消费者按 OpenEvent seq 顺序接受
 都不能改变结果。
 `infer.append` 不能直接接在 request 后；消费者在尚未接受无 body result 时收到 append，必须只向该调用报告协议错误，
 不能用它建立流式链。
-`stream_id` 是调用方生成的字符串，用来表示一次模型调用；普通和流式调用都使用它。`request_seq` 不是另一套随机
-ID，它直接使用发起这次调用的 `infer.request` 写入 OpenEvent 后得到的 `seq`。后续可能出现相同 `stream_id` 的重复
-request，所以 append、end 和 cancel 还必须带 `request_seq`，精确说明自己属于或要终止哪一条 request 事件。
-request 发布成功后 `request_seq` 已经确定，因此 end 或 cancel 可以在 result 之前发送。result 不重复携带
-`request_seq`，而是让 `prev_seq` 等于目标 request 的 `request_seq`。
+request 发布成功后，end 或 cancel 可以在 result 之前发送。
 
 ### 6.1 infer.append
 
@@ -305,9 +281,7 @@ Provider 终态都直接写成 `infer.end`，不会先把终态事件写成 appe
 
 Responses 正常完成时结构相同，但 `end_status="completed"`，且 `body.type="response.completed"`。
 
-`response.incomplete` 表示 Provider 已结束本次生成，但内容没有生成完整，例如达到输出 token 上限。它使用上述
-failed end 结构，`body.type` 仍是 `response.incomplete`，完整保留原始事件及 `response.incomplete_details`；
-`status_code` 保留实际 HTTP 状态码，即使为 200 也按失败终态处理。此前已发布的 append 保留。
+`response.incomplete` 也使用 failed end 结构，完整保留原始事件及 `response.incomplete_details`；此前已发布的 append 保留。
 
 `request_seq` 等于 request 的 seq，`stream_id` 必须与该 request 一致。end 不声明自己接在哪一条 append 后面；
 它只按 `request_seq` 定位流，并以自己的 OpenEvent seq 参与终态裁决。
@@ -326,21 +300,15 @@ failed end 结构，`body.type` 仍是 `response.incomplete`，完整保留原�
   `body` 是标准 Model Proxy 错误对象。
   已有 append 仍然有效，消费者 MUST 保留。
 
-`failed` 和 `interrupted` end 必须包含 `body`，所有 end 都不得包含 `headers`。Worker 根据对应 request
-校验 completed 的 endpoint-specific body 规则；单独解析一条 end
-payload 无法从 payload 本身推断 endpoint。
+Worker 根据对应 request 校验 completed 的 endpoint-specific body 规则。
 
 completed 和 failed end 的 `status_code` 必须是 Provider HTTP 状态码 `100..599`。interrupted end 的
 `status_code` 只能是 `60000`、`60001`、`60002`、`60003`、`60007` 或 `60008`。
 
-Worker 按第 4.1 节的 Provider 终态标记生成 completed 或 failed end。Responses 的失败终态表示模型结果，
-不是传输中断，即使 HTTP 状态为 200 也一样。对应终止标记前遇到干净 EOF 视为 Provider 流不完整，写
+对应终止标记前遇到干净 EOF 视为 Provider 流不完整，写
 `interrupted` end。流事件/JSON 解析失败、Provider 连接或流式空闲超时、连接重置，以及 Worker 在终态事件
 持久化前重启，也均写 `interrupted` end。
-流在 OpenEvent seq 顺序中第一个被接受的带 body result、end 或 cancel 后结束；终态之后到达的 result、append、end、
-cancel 全部忽略，包括终态提交时已经在途、但随后才落库的发布。end 不引用最后一条 append，因此即使一条
-在途 append 晚于 end 提交，它也只会被终态规则忽略，不会造成 end 断链。关闭本地读取或 Subscribe 中断
-不是协议终态。
+终态之后提交的在途输出同样忽略。关闭本地读取或 Subscribe 中断不是协议终态。
 
 ### 6.3 infer.cancel
 
@@ -359,8 +327,7 @@ cancel 全部忽略，包括终态提交时已经在途、但随后才落库的�
 
 对于尚未进入终态的 stream，cancel 自身就是 `60004 / STREAM_CANCELLED` 终态，不要求后续 `infer.end`。
 Worker 观察到获胜 cancel 后不再发起新的输出发布；当时已经在途、后来才提交的输出由终态规则忽略。
-目标 `request_seq` 不存在、`stream_id` 不匹配或调用已经终态时，cancel 忽略。同一调用的多个 cancel 只接受
-OpenEvent seq 最小的一条；带 body result、end 与 cancel 同样按 seq 接受最早的合法候选终态。
+目标 `request_seq` 不存在、`stream_id` 不匹配或调用已经终态时，cancel 忽略。
 
 ## 7. Model Proxy 扩展状态码
 
@@ -383,9 +350,6 @@ DNS、TCP 建连、TLS、发送请求还是等待响应头，都使用 `60000`�
 DNS、TLS 或连接失败，才分别使用 `60001`、`60002` 或 `60003`。收到响应头后的读取空闲超时使用
 `60000`，明确的连接重置使用 `60003`。不得在 deadline 到达后仅按当前阶段猜测错误码。
 
-`infer.cancel` 本身表示 `60004 / STREAM_CANCELLED`，不携带错误 body，也不要求用
-`infer.end` 表示取消。
-
 Worker 自己生成、使用 Model Proxy 扩展状态码的错误 result/end 统一使用下面的错误 body，`error.code` 必须和
 `status_code` 对应：
 
@@ -406,10 +370,6 @@ Provider 返回的 HTTP 错误正文和 `response.failed`、`response.incomplete
 
 1. 无 body result 尚未写入时，不补写 result。
 2. 无 body result 已写入时，保留它的 Provider HTTP 状态码和此前已写出的 append；end 记录中断原因，不改写已有输出。
-
-例如，provider 返回 HTTP 200 后连接被重置，结果是 `result.status_code=200`、`end.status_code=60003`；
-provider 一直没有返回响应头而超时，则只写 `end.status_code=60000`；保留的响应头过大时只写
-`end.status_code=60008`。这样调用方不需要猜测失败发生在流链建立之前还是之后。
 
 ## 8. Payload 大小与重启结果
 
@@ -443,5 +403,3 @@ OpenEvent seq 接受最早的匹配带 body result、合法 end 或合法 cancel
 request 无论 `body.stream` 是否为 `true`，都补写 `60007` 普通终态 result，`prev_seq` 指向这条重复 request 自己的 seq。
 恢复只表达“上一次处理没有留下终态”，不猜测停止前原本要写 `60005`、`60008`、`60009` 还是 Provider 终态，也不读取
 新 Provider 配置重新解释旧 request。
-
-本文是当前唯一有效的 `llm.v1` 契约，不保留旧草案的兼容规则。

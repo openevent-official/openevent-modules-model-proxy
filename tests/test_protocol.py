@@ -119,7 +119,10 @@ class ProtocolTests(unittest.TestCase):
 
     def test_json_failures_have_no_partial_context(self):
         for payload in (b"\xff", b"{", b"{} trailing", b'\xef\xbb\xbf{}', b'NaN',
-                        b'{"kind":"infer.request","body":Infinity}', b"1e9999", "{}"):
+                        b'{"kind":"infer.request","body":Infinity}',
+                        b'{"kind":"infer.request","body":{"input":[NaN]}}',
+                        b'{"kind":"infer.request","body":{"input":[1e9999]}}',
+                        b"1e9999", "{}"):
             with self.subTest(payload=payload):
                 with self.assertRaises(PayloadValidationError) as caught:
                     parse_payload(payload)

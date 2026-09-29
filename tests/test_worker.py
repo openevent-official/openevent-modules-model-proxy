@@ -17,6 +17,7 @@ from openevent.model_proxy_sdk import (
     InferRequestInput, InferResultInput, InferAppendInput, InferEndInput, InferCancelInput,
     PayloadValidationError, parse_message, parse_payload,
 )
+from openevent.model_proxy_sdk.publishing import _publish
 
 
 def config(*, limit=4096, concurrency=1, retries=0):
@@ -107,7 +108,7 @@ class OpenEvent:
     def get_status(self, **kwargs):
         if self.status_error is not None:
             raise self.status_error
-        return pb.GetStatusResponse(min_seq=0, max_seq=self.target)
+        return pb.GetStatusResponse(max_seq=self.target)
 
     def fetch(self, **kwargs):
         self.fetch_calls.append(kwargs)
@@ -173,6 +174,39 @@ class Provider:
 
     def abort(self):
         self.aborted.set()
+
+
+class StoppingPublication(OpenEvent):
+    def __init__(self, stage, *, fail=True, **kwargs):
+        super().__init__(**kwargs)
+        self.stage = stage
+        self.fail = fail
+        self.on_target = None
+        self.calls = {"uuid": 0, "publish": 0, "query": 0}
+
+    def before(self, stage):
+        self.calls[stage] += 1
+        if stage == self.stage:
+            self.on_target()
+            if self.fail:
+                raise RpcError("UNAVAILABLE")
+
+    def get_uuid(self):
+        self.before("uuid")
+        return super().get_uuid()
+
+    def publish_auto_seq(self, **kwargs):
+        self.before("publish")
+        if self.stage == "query":
+            if not self.published:
+                super().publish_auto_seq(**kwargs)
+                raise RpcError("UNAVAILABLE")
+            raise RpcError("ALREADY_EXISTS")
+        return super().publish_auto_seq(**kwargs)
+
+    def get_seq_by_uuid(self, uuid):
+        self.before("query")
+        return super().get_seq_by_uuid(uuid)
 
 
 class ProviderFactory:
@@ -321,11 +355,10 @@ class WorkerTests(unittest.TestCase):
         worker = Worker(config(), client=transport, provider_factory=ProviderFactory())
         worker.recover()
         self.assertEqual(transport.published, [])
-        self.assertEqual(worker.requests[3].terminal_seq, 6)
-        self.assertEqual(worker.requests[3].chain_seq, 5)
-        self.assertEqual(worker.requests[9].terminal_seq, 10)
+        self.assertEqual(worker.requests, {})
+        self.assertEqual(worker.originals, {(3, "ordinary"), (3, "stream")})
 
-    def test_recovery_retains_identity_and_terminal_state_without_request_bodies(self):
+    def test_recovery_retains_only_unfinished_states_until_terminal_replay(self):
         history = [
             request(1, "done", body={"input": "x" * 32768}),
             event(2, InferResultInput(stream_id="done", prev_seq=1, status_code=200, body={})),
@@ -345,9 +378,8 @@ class WorkerTests(unittest.TestCase):
             worker.recover()
         self.assertTrue(all(reference() is None for reference in parsed_requests))
         self.assertTrue(all(state.body is None for state in worker.requests.values()))
-        self.assertEqual(worker.originals, {(3, "done"): 1, (3, "unfinished"): 3})
-        self.assertEqual(worker.requests[1].terminal_seq, 2)
-        self.assertFalse(worker.requests[1].streaming)
+        self.assertEqual(worker.originals, {(3, "done"), (3, "unfinished")})
+        self.assertEqual(set(worker.requests), {3})
         self.assertTrue(worker.requests[3].streaming)
         self.assertEqual(worker.requests[3].request_principal, 7)
         self.assertEqual(worker.requests[3].phase, "done")
@@ -355,6 +387,50 @@ class WorkerTests(unittest.TestCase):
         interrupted = parse_payload(transport.published[0].payload)
         self.assertEqual((interrupted.kind, interrupted.request_seq, interrupted.status_code),
                          ("infer.end", 3, 60007))
+        state_ref = weakref.ref(worker.requests[3])
+        # Publication alone cannot retire the state: older in-flight outputs may
+        # precede the recovery end in the log and must still advance its chain.
+        worker._accept(parse_message(event(4, InferResultInput(
+            stream_id="unfinished", prev_seq=3, status_code=200))))
+        worker._accept(parse_message(event(5, InferAppendInput(
+            stream_id="unfinished", request_seq=3, prev_seq=4, body={}))))
+        self.assertEqual(worker.requests[3].chain_seq, 5)
+        worker._accept(parse_message(transport.published[0]))
+        self.assertEqual(worker.requests, {})
+        self.assertIsNone(state_ref())
+        worker._accept(parse_message(event(102, InferAppendInput(
+            stream_id="unfinished", request_seq=3, prev_seq=4, body={"late": True}))))
+        self.assertEqual(worker.requests, {})
+
+    def test_completed_history_releases_states_and_preserves_stream_id_dedup(self):
+        history = []
+        for seq in range(1, 128, 2):
+            history.extend((request(seq), event(seq + 1, InferResultInput(
+                stream_id=f"s{seq}", prev_seq=seq, status_code=200, body={}))))
+        transport = OpenEvent(history=history, subscriptions=[Subscription([request(129, "s1")])])
+        transport.seq = 129
+        factory = ProviderFactory()
+        worker = Worker(config(), client=transport, provider_factory=factory)
+        states = []
+        accept = worker._accept
+
+        def record_accept(parsed, **kwargs):
+            accept(parsed, **kwargs)
+            if parsed.payload.kind == "infer.request":
+                states.append(weakref.ref(worker.requests[parsed.seq]))
+
+        with patch.object(worker, "_accept", side_effect=record_accept):
+            _, errors = self.start(worker)
+            self.assertTrue(transport.wait_published(1))
+            self.assertTrue(wait_until(lambda: not worker.requests))
+            self.assertTrue(wait_until(lambda: all(ref() is None for ref in states)))
+        self.assertEqual(len(states), 65)
+        self.assertEqual(len(worker.originals), 64)
+        self.assertIn((3, "s1"), worker.originals)
+        output = parse_payload(transport.published[0].payload)
+        self.assertEqual((output.prev_seq, output.status_code), (129, 60005))
+        self.assertEqual(factory.calls, [])
+        self.assertEqual(errors, [])
 
     def test_channel_validation_is_fatal_before_scan_or_provider(self):
         for change in (dict(protocol="other"), dict(visibility=0), dict(members=[7]),
@@ -387,7 +463,7 @@ class WorkerTests(unittest.TestCase):
                          [("infer.result", 2, 60005, True), ("infer.result", 3, 60008, True),
                           ("infer.result", 4, 60009, True), ("infer.result", 5, 60005, True)])
         self.assertEqual(len(factory.calls), 1)
-        self.assertTrue(all(worker.requests[seq].body is None for seq in (2, 3, 4, 5)))
+        self.assertTrue(wait_until(lambda: set(worker.requests) == {1}))
         self.assertEqual(errors, [])
         self.assertTrue(thread.is_alive())
 
@@ -400,12 +476,15 @@ class WorkerTests(unittest.TestCase):
         _, errors = self.start(worker)
         self.assertTrue(factory.called.wait(2))
         stream.items.put(request(2, "queued", stream=True))
+        self.assertTrue(wait_until(lambda: worker.last_seen_seq == 2))
+        state_ref = weakref.ref(worker.requests[2])
         stream.items.put(event(3, InferCancelInput(stream_id="queued", request_seq=2)))
         self.assertTrue(wait_until(lambda: worker.last_seen_seq == 3))
-        self.assertIsNone(worker.requests[2].body)
+        self.assertNotIn(2, worker.requests)
+        self.assertIsNone(state_ref(), "The pending queue must not retain cancelled task objects")
         stream.items.put(event(4, InferCancelInput(stream_id="busy", request_seq=1)))
         self.assertTrue(factory.instances[0].aborted.wait(2))
-        self.assertTrue(wait_until(lambda: worker.running == 0 and not worker.pending))
+        self.assertTrue(wait_until(lambda: worker.running == 0 and not worker.pending and not worker.requests))
         self.assertEqual(len(factory.calls), 1)
         self.assertEqual(transport.published, [])
         self.assertEqual(errors, [])
@@ -433,13 +512,17 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(len(factory.calls), 2)
         self.assertEqual(factory.calls[1][1], queued_body)
         self.assertEqual(factory.calls[1][2], "/v1/responses")
-        self.assertIsNone(worker.requests[1].body)
+        self.assertNotIn(1, worker.requests)
         self.assertIsNone(worker.requests[2].body)
         self.assertIsNone(worker.requests[2].operation)
         # Output delivery is paused: the body is released even before the reader
         # learns that the successfully published result is terminal.
         self.assertIsNone(worker.requests[2].terminal_seq)
         self.assertEqual(parse_payload(transport.published[0].payload).body, {"answer": "ok"})
+        state_ref = weakref.ref(worker.requests[2])
+        stream.items.put(transport.published[0])
+        self.assertTrue(wait_until(lambda: not worker.requests))
+        self.assertTrue(wait_until(lambda: state_ref() is None))
         self.assertEqual(errors, [])
 
     def test_stopping_releases_pending_request_body(self):
@@ -448,6 +531,148 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(worker.requests[1].body, {"input": "queued"})
         worker.stop()
         self.assertIsNone(worker.requests[1].body)
+
+    def test_stop_during_recovery_does_not_retry_publication_rpcs(self):
+        for stage in ("uuid", "publish", "query"):
+            with self.subTest(stage=stage):
+                transport = StoppingPublication(stage, history=[request(1)])
+                failures = []
+                worker = Worker(config(retries=3), client=transport, on_fatal=failures.append)
+                transport.on_target = worker.stop
+                worker.run()
+                self.assertEqual(transport.calls[stage], 1)
+                self.assertEqual(transport.subscribe_calls, [])
+                self.assertTrue(transport.closed)
+                self.assertTrue(worker.stopped.is_set())
+                self.assertIsNone(worker._failure)
+                self.assertEqual(failures, [])
+
+    def test_stop_during_background_publication_is_not_fatal(self):
+        for control in (False, True):
+            for stage in ("before_uuid", "uuid", "publish", "query"):
+                with self.subTest(control=control, stage=stage):
+                    stream = Subscription([request(1, provider="missing" if control else None)])
+                    transport = StoppingPublication(stage, subscriptions=[stream])
+                    transport.deliver_outputs = False
+                    factory = ProviderFactory(outputs=[ProviderEvent("result", 200, body={}, has_body=True)])
+                    failures = []
+                    worker = Worker(config(retries=3), client=transport,
+                                    provider_factory=factory, on_fatal=failures.append)
+                    transport.on_target = worker.stop
+
+                    def publish(*args, **kwargs):
+                        if stage == "before_uuid":
+                            worker.stop()
+                        return _publish(*args, **kwargs)
+
+                    with patch("openevent.model_proxy.worker._publish", side_effect=publish):
+                        thread, errors = self.start(worker)
+                        self.assertTrue(worker.stopped.wait(2))
+                        self.assertTrue(wait_until(lambda: worker.requests[1].phase == "done"))
+                        thread.join(2)
+                    if stage == "before_uuid":
+                        self.assertEqual(transport.calls, {"uuid": 0, "publish": 0, "query": 0})
+                    else:
+                        self.assertEqual(transport.calls[stage], 1)
+                    self.assertFalse(thread.is_alive())
+                    self.assertEqual(worker.running, 0)
+                    self.assertIsNone(worker._failure)
+                    self.assertEqual(failures, [])
+                    self.assertEqual(errors, [])
+
+    def test_stop_preserves_success_from_inflight_publish_or_query(self):
+        for stage in ("publish", "query"):
+            with self.subTest(stage=stage):
+                transport = StoppingPublication(stage, fail=False)
+                worker = Worker(config(retries=3), client=transport)
+                transport.on_target = worker.stop
+                worker._accept(parse_message(request(1)), historical=True)
+                seq = worker._error_output(worker.requests[1], 60007, recovery=True)
+                self.assertEqual(seq, transport.published[0].seq)
+                self.assertEqual(len(transport.published), 1)
+                self.assertEqual(transport.calls[stage], 1)
+                self.assertTrue(worker.stopped.is_set())
+                self.assertIsNone(worker._failure)
+
+    def test_cancel_does_not_stop_retries_of_inflight_publication(self):
+        stream = Subscription([request(1, "cancelled", stream=True)])
+        transport = OpenEvent(subscriptions=[stream])
+        factory = ProviderFactory(outputs=[ProviderEvent("headers", 200)])
+        worker = Worker(config(retries=1), client=transport, provider_factory=factory)
+        publish = transport.publish_auto_seq
+        attempts = []
+
+        def cancel_during_publish(**kwargs):
+            attempts.append(kwargs)
+            if len(attempts) == 1:
+                stream.items.put(event(2, InferCancelInput(stream_id="cancelled", request_seq=1)))
+                self.assertTrue(wait_until(lambda: worker.last_seen_seq == 2))
+                raise RpcError("UNAVAILABLE")
+            return publish(**kwargs)
+
+        transport.publish_auto_seq = cancel_during_publish
+        _, errors = self.start(worker)
+        self.assertTrue(transport.wait_published(1))
+        self.assertTrue(wait_until(lambda: worker.running == 0))
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertFalse(worker.stopped.is_set())
+        self.assertIsNone(worker._failure)
+        self.assertEqual(errors, [])
+
+    def test_terminal_before_publish_returns_keeps_running_task_until_cleanup(self):
+        for control in (False, True):
+            with self.subTest(control=control):
+                publishing, release = threading.Event(), threading.Event()
+
+                class DelayedPublish(OpenEvent):
+                    def publish_auto_seq(self, **kwargs):
+                        result = super().publish_auto_seq(**kwargs)
+                        publishing.set()
+                        if not release.wait(3):
+                            raise AssertionError("Publication was not released")
+                        return result
+
+                stream = Subscription([request(1, provider="missing" if control else None)])
+                transport = DelayedPublish(subscriptions=[stream])
+                factory = ProviderFactory(outputs=[ProviderEvent("result", 200, body={}, has_body=True)])
+                worker = Worker(config(), client=transport, provider_factory=factory)
+                _, errors = self.start(worker)
+                self.addCleanup(release.set)
+                self.assertTrue(publishing.wait(2))
+                self.assertTrue(wait_until(lambda: worker.last_seen_seq == 101))
+                state_ref = weakref.ref(worker.requests[1])
+                self.assertEqual(worker.requests[1].terminal_seq, 101)
+                self.assertEqual(worker.requests[1].phase, "running")
+                # Even an already terminal task must remain reachable by stop()
+                # until its in-flight publisher returns and releases the operation.
+                worker.stop()
+                if not control:
+                    self.assertTrue(factory.instances[0].aborted.is_set())
+                release.set()
+                self.assertTrue(wait_until(lambda: not worker.requests))
+                self.assertTrue(wait_until(lambda: state_ref() is None))
+                self.assertEqual(worker.originals, {(3, "s1")})
+                self.assertEqual(errors, [])
+
+    def test_cancelled_control_queue_entry_does_not_retain_state_or_publish(self):
+        transport = OpenEvent()
+        worker = Worker(config(), client=transport, provider_factory=ProviderFactory())
+        worker._accept(parse_message(request(1, "missing", stream=True, provider="missing")))
+        state_ref = weakref.ref(worker.requests[1])
+        worker._accept(parse_message(event(2, InferCancelInput(stream_id="missing", request_seq=1))))
+        self.assertEqual(worker.requests, {})
+        self.assertIsNone(state_ref())
+        thread = threading.Thread(target=worker._control_outputs, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(wait_until(lambda: not worker.controls))
+        finally:
+            worker.stop()
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(transport.published, [])
+        self.assertEqual(worker.originals, {(3, "missing")})
 
     def test_encoded_output_overflow_becomes_small_error(self):
         for streaming in (False, True):

@@ -8,13 +8,13 @@ import importlib.metadata
 try:
     version = importlib.metadata.version('openevent-sdk')
 except importlib.metadata.PackageNotFoundError:
-    raise SystemExit('openevent-sdk>=0.8.0 must already be installed') from None
+    raise SystemExit('openevent-sdk>=0.11.1 must already be installed') from None
 try:
     from packaging.specifiers import SpecifierSet
 except ImportError:
     raise SystemExit('Install the packaging test dependency before running e2e; see README.md') from None
-if not SpecifierSet('>=0.8.0').contains(version, prereleases=True):
-    raise SystemExit(f'openevent-sdk>=0.8.0 must already be installed; found {version}')
+if not SpecifierSet('>=0.11.1').contains(version, prereleases=True):
+    raise SystemExit(f'openevent-sdk>=0.11.1 must already be installed; found {version}')
 from openevent.sdk import OpenEventClient
 PY
 TASK_SERVER="${OPENEVENT_SERVER_BIN:-}"

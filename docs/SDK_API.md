@@ -2,12 +2,10 @@
 
 [中文版](SDK_API_cn.md)
 
-> Status: current public contract
-
-This is the sole authoritative document for the public Python API of `openevent.model_proxy_sdk`.
-See [LLM_PROTOCOL.md](LLM_PROTOCOL.md) for protocol fields and state machines, and
-[RESULT_PUBLISHING.md](RESULT_PUBLISHING.md) for single-message publishing outcomes.
-[SDK_USAGE.md](SDK_USAGE.md) contains usage examples only.
+This document defines the public API of `openevent.model_proxy_sdk`.
+See [LLM_PROTOCOL.md](LLM_PROTOCOL.md) for protocol fields and state machines,
+[RESULT_PUBLISHING.md](RESULT_PUBLISHING.md) for single-message publishing outcomes,
+and [SDK_USAGE.md](SDK_USAGE.md) for examples.
 
 ## 1. Two API Layers
 
@@ -15,39 +13,8 @@ See [LLM_PROTOCOL.md](LLM_PROTOCOL.md) for protocol fields and state machines, a
 - OpenAI-like client: starts calls and waits for results through synchronous
   `chat.completions.create(...)` and `responses.create(...)` methods.
 
-Import all public types in this module from `openevent.model_proxy_sdk`.
-
-```python
-from openevent.model_proxy_sdk import (
-    InferAppend,
-    InferAppendInput,
-    InferCancel,
-    InferCancelInput,
-    InferEnd,
-    InferEndInput,
-    InferRequest,
-    InferRequestInput,
-    InferResult,
-    InferResultInput,
-    ModelProxyProtocolClient,
-    OpenAI,
-    OpenAIChunk,
-    OpenAIResponse,
-    OpenAIStream,
-    ParsedMessage,
-    UNSET,
-    create_client,
-    parse_message,
-    parse_payload,
-    publish_infer_append,
-    publish_infer_cancel,
-    publish_infer_end,
-    publish_infer_request,
-    publish_infer_result,
-)
-```
-
-Import the OpenEvent types used by this API through the OpenEvent SDK's public path:
+Import the classes, functions, constants, and exceptions below from `openevent.model_proxy_sdk`.
+Import OpenEvent types from the SDK:
 
 ```python
 from openevent.sdk import OpenEventClient, openevent_pb2
@@ -202,24 +169,17 @@ not the total model call duration. An established Subscribe has no whole-stream 
 `max_retries` and `retry_interval_ms` have the same meaning as in Section 2.1 and apply to this
 instance's ordinary OpenEvent RPCs and reliable request/cancel publishing.
 
-Missing, incorrectly typed, or invalid constructor arguments raise `ConfigurationError`.
-Arguments outside the signature raise Python's ordinary `TypeError`. The client does not accept
-`api_key`, `base_url`, an external OpenEvent client, or an external gRPC channel.
+Missing, incorrectly typed, or invalid constructor arguments raise `ConfigurationError`;
+arguments outside the signature raise `TypeError`.
 
-`on_subscription_error` is invoked synchronously once per instance when initialization, establishment,
-reading, or reconnection of the shared subscription finally fails. Its argument is an
-`OpenEventSubscriptionError` constructed according to Section 5. Initialization includes the first `GetStatus` used to prepare the replay
-position: its failure triggers notification even before any Subscribe exists. Protocol parsing or
-request-consistency errors that finally fail the shared subscription also trigger notification.
-
-Retryable faults do not invoke the callback while retries or reconnection are still underway. A permanent
-error or exhausted retry budget constitutes final failure; the subscription protocol errors above fail
-immediately. The callback promptly reports that the instance has stopped receiving new messages.
-When individual calls raise the subscription error still follows the buffered-output and in-flight
-publishing rules in Section 5. Exceptions raised by the callback are logged and do not replace the
-subscription error. Subscription errors caused by `OpenAI.close()` follow the same retry and final
-failure rules and are not exempt from notification. The callback may close the same client; `close()`
-does not wait for the callback to exit.
+`on_subscription_error` is invoked synchronously once per instance on final subscription failure,
+with the `OpenEventSubscriptionError` defined in Section 5. Triggers include a permanent error or
+exhausted retries during the first `GetStatus`, Subscribe establishment, reading, or reconnection,
+and message-parsing or request-consistency failures. Temporary faults still being retried do not
+notify; faults caused by closing the underlying connection follow the same rules.
+The callback reports that the instance has stopped receiving new messages; individual calls receive
+errors according to Section 5. Callback exceptions are logged without replacing the subscription
+error. The callback may close the same client; `close()` does not wait for it to exit.
 
 ### 3.2 Starting a Call
 
@@ -235,31 +195,24 @@ use its default provider; an omitted `prev_seq` produces no such field. All rema
 arguments form the corresponding OpenAI request body. `stream=True` returns `OpenAIStream`;
 an absent or `False` stream parameter waits for an ordinary result.
 
-The first call prepares a replay position with one logical `GetStatus`; concurrent first calls share
-this preparation. Once the position is ready, the subscription connects in the background. Request
-publishing does not wait for Subscribe acceptance, and new calls are allowed during reconnection.
-After connecting or reconnecting, the SDK reads requests and model output committed during that
-interval from the saved position. Final subscription failure rejects new calls under Section 5;
-calls after the underlying connection closes follow Section 4.
+The first call prepares a replay position with one logical `GetStatus`; concurrent first calls
+share it. The subscription then connects in the background. Request publishing need not wait for
+Subscribe acceptance or reconnection; a recovered connection replays from the saved position.
+Calls after final subscription failure or closure follow Sections 5 and 4, respectively.
 
 If creating or starting the local subscription reader fails before the thread starts, the current
 call raises the original exception, publishes no request, and invokes no subscription-error callback.
 The client retains its state before initial preparation; other waiting or later calls may prepare again.
 
-Publishing a request and waiting for a model response are separate phases. Publishing waits only for
-the reliable publishing API's seq or publishing error, not Worker output. After successful publication,
-ordinary `create()` waits for the model response; streaming `create()` returns `OpenAIStream`, whose
-iterator supplies output to the business caller. Returning the stream does not require an established
-subscription or received model response headers or body. Already established subscription errors
-still follow Section 5. The public return object's `request_seq` comes only
-from the reliable publishing API's successful return value.
+Publishing waits only for the reliable publishing API's seq or error; `request_seq` uses only its
+successful return value. After publication succeeds, ordinary `create()` waits for the model response;
+streaming `create()` returns `OpenAIStream` without waiting for subscription establishment or a model
+response. Existing subscription errors still follow Section 5.
 
-The shared subscription may receive and buffer a call's output before its publishing API returns,
-while continuing to process other calls. Buffered output serves ordinary `create()` results or stream
-iteration; publishing neither reads this output nor depends on it to finish. Before successful
-publication, the call delivers no model result or stream object to the business caller. If publishing
-finally fails, the call discards its buffered output and raises the original `ResultPublishError`
-without changing the publishing conclusion because a request or model output was observed.
+While publishing, the SDK may buffer early output and continue receiving other calls' messages.
+Results or stream objects are delivered only after publication succeeds. Final publishing failure
+discards that call's buffered output and raises the original `ResultPublishError`; subscribed
+messages do not change the publishing conclusion.
 
 ### 3.3 Ordinary Return Object
 
@@ -304,16 +257,11 @@ A completed end without a body gives `terminal_has_body=False` and `terminal_bod
 A completed end with a JSON null body gives `terminal_has_body=True` and `terminal_body=None`.
 Other terminal outcomes do not set these two completed-end properties.
 
-Messages accepted before the publishing API returns are initially saved inside the call. When
-publication succeeds and the stream is returned, all already determined properties are immediately
-readable. Property access only reads information already saved by the SDK; it neither waits for later
-messages nor consumes the output queue. After the stream is returned, accepted response information
-is not cleared by business iteration, closing, or subscription failure. Ignored duplicates and messages
-after a terminal event do not overwrite it.
-
-Visible properties do not mean that the caller has consumed all output. Even if `terminal_body` is
-already readable, the iterator still yields earlier queued chunks in order before stopping or raising
-the corresponding exception. Chunks already returned remain valid when the stream fails.
+Information received before publication completes is readable as soon as the stream is returned.
+Property reads neither wait for messages nor consume the queue. Determined values are not cleared
+or overwritten by iteration, closure, subscription failure, duplicates, or messages after a terminal
+event. Even when `terminal_body` is readable, the iterator yields queued chunks in order before
+ending or raising an error. Chunks already returned remain valid if the stream fails.
 
 ## 4. Closing
 
@@ -333,25 +281,18 @@ no UUID, publishes no cancel, and starts no other OpenEvent request. Existing ou
 continue to follow Section 5; closing itself does not raise the subscription error again. A cancel
 already in progress finishes under Section 5, preserving actual publishing errors.
 
-`OpenAI.close()` only calls the instance's owned `OpenEventClient.close()`. The OpenEvent SDK closes
-its own gRPC channel; the Model SDK neither operates the channel directly nor maintains a separate
-client-closing state. Repeated closes follow the underlying client's idempotent behavior;
-the duration of the closing call itself is determined by `OpenEventClient.close()`.
+`OpenAI.close()` calls the instance's owned `OpenEventClient.close()`; repeated calls follow its
+idempotent behavior, and it determines the call's duration. Closing adds no wait for publication, the subscription thread,
+or callbacks to finish, and does not automatically cancel individual streams. Other calls and
+background tasks may still be running when it returns; committed messages remain and the Worker
+and Provider may continue running.
 
-The Model SDK adds no wait for a final publishing conclusion, the subscription reader, or user callbacks. It does
-not automatically close individual streams or publish `infer.cancel`, clear result queues, freeze
-receipt, stop retries, or construct a special closing exception. Request publishing, Subscribe, and
-result reading continue through their existing paths: underlying errors follow ordinary RPC retries,
-reliable publishing, and this document's exception rules. Final subscription failure still enters
-`FAILED`, invokes the callback, and wakes waiting calls. Calling `close()` does not change the
-prohibition on sending requests after `FAILED`.
-
-A return from `close()` only means that the underlying client has closed. Other calls or background
-tasks may still be running; closing neither reverses committed messages nor guarantees that the
-Worker or Provider stops. Already received output, terminal events, and errors follow the existing
-queue and publishing-conclusion rules rather than being replaced because of closure. A later
-`create()` does not recreate the underlying client: it raises the saved subscription error if already
-`FAILED`, or processes underlying errors through the existing call path otherwise.
+Closing preserves existing queues, output, terminal events, and errors. It sets no receipt boundary
+or special closing exception and does not directly stop retries. Underlying errors still follow
+ordinary RPC retry rules, reliable publishing, and Section 5. Final subscription failure enters
+`FAILED`, invokes the callback, and wakes waiters; the prohibition on later requests remains.
+A later `create()` uses the closed underlying client: it raises the saved subscription error if
+already `FAILED`, or processes the underlying error otherwise.
 
 The client supports context management. Callers must explicitly close it or use `with`; do not depend
 on garbage collection to determine when it closes.
@@ -457,38 +398,8 @@ error identifies a request that conflicts with its frozen content or the returne
 that call's buffered results cannot be delivered; after successful publication, the call still ends
 with this subscription error.
 
-If the request UUID is still being allocated when the subscription finally fails, before local
-prepublication registration completes, first wait for allocation to finish. Allocation failure still
-returns the original `ResultPublishError`; allocation success no longer publishes the request and
-instead returns the saved subscription error. Final failure of the first `GetStatus` occurs
-before any request begins publishing and directly returns `OpenEventSubscriptionError`. Closing
-the underlying connection does not change these exception-selection rules.
-
-Public exceptions include:
-
-```python
-from openevent.model_proxy_sdk import (
-    APIConnectionError,
-    APIError,
-    APIStatusError,
-    APITimeoutError,
-    AuthenticationError,
-    BadRequestError,
-    CommitState,
-    ConfigurationError,
-    ConflictError,
-    InternalServerError,
-    NotFoundError,
-    OpenEventSubscriptionError,
-    PayloadValidationError,
-    PermissionDeniedError,
-    ProtocolError,
-    RateLimitError,
-    ResultPublishError,
-    StreamCancelledError,
-    UnprocessableEntityError,
-)
-```
+Final failure of the first `GetStatus` occurs before request publication and directly returns
+`OpenEventSubscriptionError`.
 
 The fields and decision rules for `ResultPublishError` and `CommitState` are defined only in the
 single-event reliable publishing contract.

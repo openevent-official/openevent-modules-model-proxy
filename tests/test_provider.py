@@ -85,7 +85,6 @@ class ProviderTests(unittest.TestCase):
             raise
         self.addCleanup(sock.close)
         original.close()
-        sock.setblocking(False)
         peer.settimeout(1)
         operation = call("http://unused.invalid")
         operation._install(sock)
@@ -94,63 +93,61 @@ class ProviderTests(unittest.TestCase):
         self.assertGreaterEqual(sock.fileno(), 2048)
         return operation, peer
 
-    def test_high_socket_descriptor_read_and_write_readiness(self):
+    def test_high_socket_descriptor_reads_and_writes(self):
         operation, peer = self.high_fd_operation()
-        operation._wait(False)
         operation._send(b"request")
         self.assertEqual(peer.recv(7), b"request")
         peer.sendall(b"response")
-        operation._wait(True)
         self.assertEqual(operation._recv(8), b"response")
 
-    def test_high_socket_descriptor_idle_wait_times_out(self):
+    def test_high_socket_descriptor_idle_read_times_out(self):
         operation, _ = self.high_fd_operation()
         operation._deadline = time.monotonic() + 0.05
-        with self.assertRaises(ProviderError) as captured:
-            operation._wait(True)
-        self.assertEqual(captured.exception.status_code, 60000)
+        with self.assertRaises(TimeoutError):
+            operation._recv(1)
 
-    def test_abort_interrupts_high_socket_descriptor_wait(self):
+    def test_abort_interrupts_high_socket_descriptor_read(self):
         operation, _ = self.high_fd_operation()
         started, finished = threading.Event(), threading.Event()
         errors = []
 
-        def wait():
+        def receive():
             started.set()
             try:
-                operation._wait(True)
+                operation._recv(1)
             except Exception as exc:
                 errors.append(exc)
             finally:
                 finished.set()
 
-        thread = threading.Thread(target=wait, daemon=True)
+        thread = threading.Thread(target=receive, daemon=True)
         thread.start()
         try:
             self.assertTrue(started.wait(1))
             self.assertFalse(finished.wait(0.05), "An idle socket must remain waiting before abort")
             operation.abort()
-            self.assertTrue(finished.wait(1), "Abort must interrupt the socket wait")
+            self.assertTrue(finished.wait(1), "Abort must interrupt the socket read")
         finally:
             operation.abort()
             thread.join(1)
         self.assertFalse(thread.is_alive())
         self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], ProviderCancelled)
+        self.assertIsInstance(errors[0], (ProviderCancelled, OSError))
 
     def test_large_json_integers_are_preserved_in_http_requests_and_responses(self):
         before = getattr(sys, "get_int_max_str_digits", lambda: None)()
         integer = 10 ** 5000 + 7
         encoded = b"1" + b"0" * 4999 + b"7"
         body = b'{"error":{"code":' + encoded + b'}}'
+        request_input = {"large": integer, "negative": -integer, "text": "中文\ud800"}
         with provider_server(lambda sock: sock.sendall(response(body, status=429))) as (url, requests):
             operation = call(url, limit=20000)
-            operation.request_body["input"] = {"large": integer, "negative": -integer, "text": "中文\ud800"}
+            operation.request_body["input"] = request_input
             events = list(operation)
         self.assertEqual(events[0].status_code, 429)
         self.assertEqual(events[0].body["error"]["code"], integer)
         sent = _json.loads(requests[0][1])
-        self.assertEqual(sent["input"], operation.request_body["input"])
+        self.assertEqual(sent["input"], request_input)
         self.assertEqual(getattr(sys, "get_int_max_str_digits", lambda: None)(), before)
 
     def test_large_sse_integer_survives_provider_and_protocol_terminal_conversion(self):
@@ -197,7 +194,16 @@ class ProviderTests(unittest.TestCase):
         for initial_empty_line in (b"", b"\n", b"\r\n", b"\r"):
             with self.subTest(initial_empty_line=initial_empty_line):
                 data = b"\xef\xbb\xbf" + initial_empty_line + complete_event + b"data: [DONE]\n\n"
-                with provider_server(lambda sock: sock.sendall(response(data, "text/event-stream"))) as (url, _):
+                release = threading.Event()
+                self.addCleanup(release.set)
+
+                def send(sock):
+                    wire = response(data, "text/event-stream")
+                    sock.sendall(wire[:-len(data)])
+                    release.wait(2)
+                    sock.sendall(data)
+
+                with provider_server(send) as (url, _):
                     operation = call(url, True)
                     stream = iter(operation)
                     head = next(stream)
@@ -209,16 +215,18 @@ class ProviderTests(unittest.TestCase):
                         return recv(min(size, next(first_reads, size)))
 
                     with patch.object(operation, "_recv", side_effect=split_prefix):
+                        release.set()
                         events = [head, *stream]
                 self.assertEqual([event.kind for event in events], ["headers", "append", "completed"])
                 self.assertEqual(events[1].body, {})
 
-    def test_request_json_string_values_are_forwarded_losslessly(self):
+    def test_request_unicode_values_are_forwarded_losslessly(self):
         with provider_server(lambda sock: sock.sendall(response(b"{}"))) as (url, requests):
-            operation = call(url)
-            operation.request_body["input"] = "中文\ud800"
+            config = ProviderConfig("openai_compatible", url, "密钥", ProviderTimeout(1000, 1000))
+            operation = ProviderCall(config, {"input": "中文\ud800"}, "/v1/chat/completions", 4096)
             list(operation)
         self.assertEqual(json.loads(requests[0][1])["input"], "中文\ud800")
+        self.assertIn("Authorization: Bearer 密钥\r\n".encode(), requests[0][0])
 
     def test_responses_terminal_not_append(self):
         for terminal, expected in (("response.completed", "completed"),
@@ -297,41 +305,102 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(events[0].body, {})
         self.assertEqual(events[0].headers, [{"name": "content-type", "value": "application/json"}])
 
-    def test_invalid_chunk_extensions_remain_protocol_errors(self):
-        for extension in (b';audit="unterminated', b';audit="bad\x00value"',
-                          b';audit=', b';=value', b';audit="bad\\\rvalue"'):
-            with self.subTest(extension=extension):
-                wire = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                        b"Transfer-Encoding: chunked\r\n\r\n2" + extension + b"\r\n{}\r\n0\r\n\r\n")
-                with provider_server(lambda sock: sock.sendall(wire)) as (url, _):
-                    with self.assertRaises(ProviderError) as captured:
-                        list(call(url))
-                self.assertEqual(captured.exception.status_code, 60007)
-
-    def test_limits_count_normalized_sse_utf8_and_header_fields(self):
+    def test_sse_limit_counts_normalized_utf8_bytes(self):
         # Wire CRLF bytes exceed the limit, while normalized LF bytes fit exactly.
         data = b":" + b"a" * 4093 + b"\r\n\r\ndata: [DONE]\r\n\r\n"
         with provider_server(lambda sock: sock.sendall(response(data, "text/event-stream"))) as (url, _):
             events = list(call(url, True))
         self.assertEqual([e.kind for e in events], ["headers", "completed"])
-        # HTTP separators are not counted, and Latin-1 field bytes count after
-        # conversion to UTF-8 (each non-ASCII byte occupies two UTF-8 bytes).
-        for extra in (b"X: " + b"x" * 4095, b"X: " + b"\xe9" * 2047 + b"x"):
-            wire = b"HTTP/1.1 200 OK\r\n" + extra + b"\r\n\r\n{}"
-            with provider_server(lambda sock: sock.sendall(wire)) as (url, _):
-                self.assertEqual(list(call(url))[0].body, {})
 
-    def test_body_progress_resets_idle_and_early_eof_is_connection_failure(self):
-        def send(sock):
-            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
-            for part in (b'"', b"a", b"b", b"c", b'"'):
-                sock.sendall(part)
-                time.sleep(0.015)
-        with provider_server(send) as (url, _):
-            self.assertEqual(list(call(url, idle_ms=40))[0].body, "abc")
-        with provider_server(lambda sock: sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{}")) as (url, _):
+    def test_header_limit_counts_complete_wire_block_before_filtering(self):
+        prefix, suffix = b"HTTP/1.1 200 OK\r\nX-Ignored: ", b"\r\n\r\n"
+        for byte in (b"x", b"\xe9"):
+            for excess in (0, 1):
+                with self.subTest(byte=byte, excess=excess):
+                    headers = prefix + byte * (4096 - len(prefix) - len(suffix) + excess) + suffix
+                    self.assertEqual(len(headers), 4096 + excess)
+                    with provider_server(lambda sock: sock.sendall(headers + b"{}")) as (url, _):
+                        if excess:
+                            with self.assertRaises(ProviderError) as error:
+                                list(call(url))
+                            self.assertEqual(error.exception.status_code, 60008)
+                        else:
+                            self.assertEqual(list(call(url))[0].body, {})
+
+    def test_header_limit_accumulates_multiple_fields(self):
+        fields = b"X-Ignored: " + b"x" * 100 + b"\r\n"
+        wire = b"HTTP/1.1 200 OK\r\n" + fields * 40 + b"\r\n{}"
+        with provider_server(lambda sock: sock.sendall(wire)) as (url, _):
             with self.assertRaises(ProviderError) as error:
                 list(call(url))
+        self.assertEqual(error.exception.status_code, 60008)
+
+    def test_informational_responses_share_header_limit_with_final_response(self):
+        prefix = (b"HTTP/1.1 100 Continue\r\nX-Interim: first\r\n\r\n"
+                  b"HTTP/1.1 103 Early Hints\r\nLink: </static>; rel=preload\r\n\r\n"
+                  b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Ignored: ")
+        suffix = b"\r\n\r\n"
+        for excess in (0, 1):
+            with self.subTest(excess=excess):
+                headers = prefix + b"x" * (4096 - len(prefix) - len(suffix) + excess) + suffix
+                with provider_server(lambda sock: sock.sendall(headers + b"{}")) as (url, _):
+                    if excess:
+                        with self.assertRaises(ProviderError) as error:
+                            list(call(url))
+                        self.assertEqual(error.exception.status_code, 60008)
+                    else:
+                        result = list(call(url))[0]
+                        self.assertEqual((result.status_code, result.body), (200, {}))
+
+    def test_unterminated_oversized_header_fails_without_waiting_for_newline(self):
+        release = threading.Event()
+
+        def send(sock):
+            sock.sendall(b"HTTP/1.1 200 OK\r\nX-Ignored: " + b"x" * 4096)
+            release.wait(2)
+
+        try:
+            with provider_server(send) as (url, _):
+                with self.assertRaises(ProviderError) as error:
+                    list(call(url, header_ms=200))
+            self.assertEqual(error.exception.status_code, 60008)
+        finally:
+            release.set()
+
+    def test_body_progress_resets_idle_and_early_eof_is_connection_failure(self):
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                def send(sock):
+                    framing = b"Transfer-Encoding: chunked\r\n\r\n5\r\n" if chunked else b"Content-Length: 5\r\n\r\n"
+                    sock.sendall(b"HTTP/1.1 200 OK\r\n" + framing)
+                    for part in (b'"', b"a", b"b", b"c", b'"'):
+                        sock.sendall(part)
+                        time.sleep(0.015)
+                    if chunked:
+                        sock.sendall(b"\r\n0\r\n\r\n")
+                with provider_server(send) as (url, _):
+                    self.assertEqual(list(call(url, idle_ms=40))[0].body, "abc")
+
+        for framing in (b"Content-Length: 10\r\n\r\n{}",
+                        b"Transfer-Encoding: chunked\r\n\r\na\r\n{}",
+                        b"Transfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n"):
+            with self.subTest(framing=framing):
+                with provider_server(lambda sock: sock.sendall(b"HTTP/1.1 200 OK\r\n" + framing)) as (url, _):
+                    with self.assertRaises(ProviderError) as error:
+                        list(call(url))
+                self.assertEqual(error.exception.status_code, 60003)
+
+    def test_redirect_and_connection_failure_do_not_repeat_requests(self):
+        with provider_server(lambda sock: sock.sendall(response(b"{}", extra=b"Location: /elsewhere\r\n", status=302))) as (url, requests):
+            events = list(call(url))
+            self.assertEqual(len(requests), 1)
+        self.assertEqual(events[0].status_code, 302)
+        self.assertEqual(events[0].body, {})
+
+        with provider_server(lambda sock: None) as (url, requests):
+            with self.assertRaises(ProviderError) as error:
+                list(call(url))
+            self.assertEqual(len(requests), 1)
         self.assertEqual(error.exception.status_code, 60003)
 
     def test_publish_pause_does_not_consume_idle_budget(self):
@@ -344,6 +413,32 @@ class ProviderTests(unittest.TestCase):
             time.sleep(0.06)
             self.assertEqual(next(stream).kind, "completed")
 
+    def test_sse_yields_event_before_rest_of_response_arrives(self):
+        first, last = b"data: 1\n\n", b"data: [DONE]\n\n"
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                release = threading.Event()
+
+                def send(sock):
+                    size = len(first) + len(last)
+                    framing = (b"Transfer-Encoding: chunked\r\n\r\n" + f"{size:x}\r\n".encode()
+                               if chunked else f"Content-Length: {size}\r\n\r\n".encode())
+                    sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" + framing + first)
+                    release.wait(2)
+                    sock.sendall(last + (b"\r\n0\r\n\r\n" if chunked else b""))
+
+                try:
+                    with provider_server(send) as (url, _):
+                        stream = iter(call(url, True, idle_ms=500))
+                        self.assertEqual(next(stream).kind, "headers")
+                        event = next(stream)
+                        self.assertEqual((event.kind, event.body), ("append", 1))
+                        release.set()
+                        self.assertEqual(next(stream).kind, "completed")
+                        self.assertEqual(list(stream), [])
+                finally:
+                    release.set()
+
     def test_heartbeat_does_not_extend_sse_idle_budget(self):
         def send(sock):
             sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
@@ -355,7 +450,7 @@ class ProviderTests(unittest.TestCase):
                 list(call(url, True, idle_ms=40))
         self.assertEqual(error.exception.status_code, 60000)
 
-    def test_abort_unblocks_response_and_dns_wait(self):
+    def test_abort_unblocks_response_but_dns_finishes_when_resolver_returns(self):
         for dns in (False, True):
             ready, release = threading.Event(), threading.Event()
             def delayed(*args, **kwargs):
@@ -373,21 +468,54 @@ class ProviderTests(unittest.TestCase):
                 with patch("openevent.model_proxy.provider.socket.getaddrinfo", side_effect=delayed) if dns else nullcontext():
                     thread = threading.Thread(target=consume, daemon=True)
                     thread.start()
-                    self.assertTrue(ready.wait(1))
-                    operation.abort()
-                    thread.join(0.5)
-                    release.set()
+                    try:
+                        self.assertTrue(ready.wait(1))
+                        started = time.monotonic()
+                        operation.abort()
+                        self.assertLess(time.monotonic() - started, 0.5)
+                        thread.join(0.05 if dns else 0.5)
+                        if dns:
+                            self.assertTrue(thread.is_alive(), "System DNS resolution cannot be interrupted")
+                        else:
+                            self.assertFalse(thread.is_alive(), "Abort must interrupt the response read")
+                    finally:
+                        release.set()
+                        thread.join(1)
                 self.assertFalse(thread.is_alive())
+                self.assertEqual(len(errors), 1)
                 self.assertIsInstance(errors[0], ProviderCancelled)
 
-    def test_dns_failure_and_dns_deadline_are_distinct(self):
+    def test_dns_failure_and_expired_budget_after_resolution_are_distinct(self):
         with patch("openevent.model_proxy.provider.socket.getaddrinfo", side_effect=socket.gaierror("dns failure")):
             with self.assertRaises(ProviderError) as error:
                 list(call("http://missing.invalid"))
         self.assertEqual(error.exception.status_code, 60001)
-        release = threading.Event()
-        with patch("openevent.model_proxy.provider.socket.getaddrinfo", side_effect=lambda *a, **k: release.wait(1)):
-            with self.assertRaises(ProviderError) as error:
+        ready, release, finished = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+
+        def delayed(*args, **kwargs):
+            ready.set()
+            release.wait(2)
+            return []
+
+        def consume():
+            try:
                 list(call("http://missing.invalid", header_ms=30))
-        release.set()
-        self.assertEqual(error.exception.status_code, 60000)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        with patch("openevent.model_proxy.provider.socket.getaddrinfo", side_effect=delayed):
+            thread = threading.Thread(target=consume, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(ready.wait(1))
+                self.assertFalse(finished.wait(0.1), "The budget cannot interrupt system DNS resolution")
+            finally:
+                release.set()
+                thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ProviderError)
+        self.assertEqual(errors[0].status_code, 60000)

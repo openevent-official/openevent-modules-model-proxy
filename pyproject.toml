@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "OpenEvent llm.v1 model proxy worker and protocol SDK"
 requires-python = ">=3.10"
 dependencies = [
-    "openevent-sdk>=0.8.0",
+    "openevent-sdk>=0.11.1",
     "PyYAML>=6.0",
 ]
 

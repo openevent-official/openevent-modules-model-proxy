@@ -72,7 +72,7 @@ def _valid_json(value, active=None):
         active.remove(id(value))
 
 
-def _validate(data):
+def _validate(data, *, decoded_json=False):
     if type(data) is not dict:
         raise PayloadValidationError("INVALID_PAYLOAD", "Payload must be a JSON object")
     kind = data.get("kind")
@@ -105,7 +105,7 @@ def _validate(data):
         fail("INVALID_METHOD", "method must be POST")
     if "path" in data and data["path"] not in ("/v1/chat/completions", "/v1/responses"):
         fail("INVALID_PATH", "Unsupported request path")
-    if "body" in data:
+    if "body" in data and not decoded_json:
         try:
             valid_body = _valid_json(data["body"])
         except RecursionError:
@@ -287,10 +287,11 @@ def parse_payload(payload):
         raise PayloadValidationError("INVALID_JSON", "payload must be valid UTF-8 JSON") from exc
     models = {"infer.request": InferRequest, "infer.result": InferResult,
               "infer.append": InferAppend, "infer.end": InferEnd, "infer.cancel": InferCancel}
-    kind = data.get("kind") if type(data) is dict else None
-    if not isinstance(kind, str) or kind not in models:
-        _validate(data)  # Preserve validation errors for payloads that cannot select a model.
-    return models[kind](data)
+    _validate(data, decoded_json=True)
+    # Decoding created an independent JSON tree; the parsed model owns it.
+    model = object.__new__(models[data["kind"]])
+    object.__setattr__(model, "_data", data)
+    return model
 
 
 @dataclass(frozen=True)
