@@ -38,7 +38,6 @@ class Call:
     streaming: bool
     frozen: object = None
     request_seq: int | None = None
-    published: bool = False
     receive: ReceiveState | None = None
     queue: deque = field(default_factory=deque)
     error: Exception | None = None
@@ -63,7 +62,6 @@ class Subscription:
         self.on_error = on_error
         self.condition = threading.Condition()
         self.failed = threading.Event()
-        self.state = "NEW"
         self.initial_from_seq = None
         self.last_seen_seq = None
         self.preparing = False
@@ -86,7 +84,6 @@ class Subscription:
                     return
                 if not self.preparing:
                     self.preparing = True
-                    self.state = "STARTING"
                     break
                 self.condition.wait()
         failure = None
@@ -106,14 +103,10 @@ class Subscription:
                 failure = self._fail_locked(error)
         else:
             with self.condition:
-                try:
-                    reader = threading.Thread(
-                        target=self._read, name="model-proxy-subscription", daemon=True,
-                    )
-                    reader.start()
-                except Exception:
-                    self.state = "NEW"
-                    raise
+                reader = threading.Thread(
+                    target=self._read, name="model-proxy-subscription", daemon=True,
+                )
+                reader.start()
                 # The reader needs this lock before it can connect. Commit the
                 # replay anchor only after its thread has started successfully.
                 self.reader = reader
@@ -155,7 +148,6 @@ class Subscription:
         failure = None
         with self.condition:
             call.request_seq = seq
-            call.published = True
             if call.receive is not None and call.receive.request_seq != seq:
                 error = self._request_error(call, "Published request seq differs from subscribed request")
                 self._invalidate_locked(call, error)
@@ -203,7 +195,6 @@ class Subscription:
             return None
         error = _copy_error(error)
         self.error = error
-        self.state = "FAILED"
         self.failed.set()
         for call in list(self.calls):
             if not call.local_closed and (call.receive is None or not call.receive.terminal):
@@ -258,7 +249,6 @@ class Subscription:
             with self.condition:
                 if self.failed.is_set():
                     raise RuntimeError("Subscription stopped")
-                self.state = "READY"
                 self.condition.notify_all()
             return stream
         except Exception:
@@ -284,6 +274,7 @@ class Subscription:
                             if not self._accept(response.message):
                                 return
                 except Exception as exc:
+                    was_connected = stream is not None
                     self._cancel(stream)
                     stream = None
                     with self.condition:
@@ -291,9 +282,7 @@ class Subscription:
                         if self.failed.is_set():
                             return
                         # A failed _connect already exhausted its round.
-                        was_ready = self.state == "READY"
-                        if was_ready and is_retryable(exc):
-                            self.state = "DEGRADED"
+                        if was_connected and is_retryable(exc):
                             self.condition.notify_all()
                             continue
                         error = OpenEventSubscriptionError(

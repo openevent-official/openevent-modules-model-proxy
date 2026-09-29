@@ -298,7 +298,7 @@ class OpenAI:
                 return
             call.close_started = True
             sub.stop_call_locked(call)
-            cancel = (not sub.failed.is_set() and call.published
+            cancel = (not sub.failed.is_set() and call.request_seq is not None
                       and (call.receive is None or not call.receive.terminal))
         error = None
         try:

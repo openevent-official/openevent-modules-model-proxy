@@ -268,12 +268,12 @@ class OpenAITest(unittest.TestCase):
             self.assertTrue(sub.condition.wait_for(
                 lambda: sub.last_seen_seq is not None and sub.last_seen_seq >= seq,
                 timeout=2,
-            ), f"Reader did not accept seq {seq}; state={sub.state}")
+            ), f"Reader did not accept seq {seq}; failed={sub.failed.is_set()}")
 
     def failed(self, client):
         sub = client._subscription
         with sub.condition:
-            self.assertTrue(sub.condition.wait_for(lambda: sub.state == "FAILED", timeout=2))
+            self.assertTrue(sub.condition.wait_for(sub.failed.is_set, timeout=2))
 
     def result(self, stream, *, body_marker=False, body=None, status=200):
         kwargs = dict(prev_seq=stream.request_seq, status_code=status)
@@ -323,7 +323,6 @@ class OpenAITest(unittest.TestCase):
                     with self.assertRaises(RuntimeError) as caught:
                         client.responses.create(input="not published")
                 self.assertIs(caught.exception, failure)
-                self.assertEqual(sub.state, "NEW")
                 self.assertFalse(sub.preparing)
                 self.assertFalse(sub.failed.is_set())
                 self.assertIsNone(sub.reader)
@@ -434,7 +433,7 @@ class OpenAITest(unittest.TestCase):
         sub = client._subscription
         with sub.condition:
             call = next(iter(sub.calls_by_uuid.values()))
-            self.assertTrue(sub.condition.wait_for(lambda: call.published, timeout=2))
+            self.assertTrue(sub.condition.wait_for(lambda: call.request_seq is not None, timeout=2))
             self.assertIsNotNone(call.frozen)
             self.assertIsNone(call.receive)
         self.server.accept()
@@ -510,7 +509,7 @@ class OpenAITest(unittest.TestCase):
             call = client._subscription.receives_by_seq[request.seq]
             self.assertIsNone(call.frozen)
             self.assertEqual(client._subscription.calls_by_uuid, {})
-            self.assertFalse(call.published)
+            self.assertIsNone(call.request_seq)
             self.assertFalse(call.receive.terminal)
             terminal = self.server.emit(
                 "end", payload.stream_id, request_seq=request.seq,
@@ -640,7 +639,8 @@ class OpenAITest(unittest.TestCase):
         with self.assertRaises(ProtocolError) as captured:
             next(bad)
         self.assertEqual(captured.exception.request_seq, bad.request_seq)
-        self.assertEqual(client._subscription.state, "READY")
+        self.assertFalse(client._subscription.failed.is_set())
+        self.assertFalse(self.server.streams[-1].cancelled)
         end = self.end(good)
         self.received(client, end.seq)
         self.assertEqual(list(good), [])
@@ -829,7 +829,7 @@ class OpenAITest(unittest.TestCase):
             creating.join()
         self.assertEqual(captured.exception.last_status, "CANCELLED")
         self.assertNotification(errors, captured.exception)
-        self.assertEqual(client._subscription.state, "FAILED")
+        self.assertTrue(client._subscription.failed.is_set())
         self.assertEqual(self.server.streams, [])
         self.assertEqual(self.server.log, [])
 
@@ -858,7 +858,9 @@ class OpenAITest(unittest.TestCase):
             Task(client.close).join()
             self.assertTrue(waiting.wait(2))
             self.assertTrue(sub.reader.is_alive())
-            self.assertEqual(sub.state, "DEGRADED")
+            self.assertIsNone(sub.active_subscribe)
+            self.assertEqual(subscribe.call_count, 1)
+            self.assertTrue(all(stream.cancelled for stream in self.server.streams))
             self.assertFalse(sub.failed.is_set())
             self.assertEqual(next(active).body, "saved")
             self.assertEqual(list(completed), [])
@@ -871,7 +873,7 @@ class OpenAITest(unittest.TestCase):
             sub.reader.join(2)
             self.assertEqual(subscribe.call_count, 2)
         self.assertNotification(errors, captured.exception)
-        self.assertEqual(sub.state, "FAILED")
+        self.assertTrue(sub.failed.is_set())
         self.assertFalse(any(json.loads(raw.payload)["kind"] == "infer.cancel" for raw in self.server.log))
 
     def test_close_wakes_normal_call_via_subscription_failure(self):
@@ -960,7 +962,7 @@ class OpenAITest(unittest.TestCase):
                 client.responses.create(stream=True)
             self.assertEqual(status.call_count, 3)
         self.assertNotification(errors, captured.exception)
-        self.assertEqual(client._subscription.state, "FAILED")
+        self.assertTrue(client._subscription.failed.is_set())
         self.assertEqual(self.server.log, [])
 
     def test_keyboard_interrupt_cleans_up_call_without_swallowing_interrupt(self):
@@ -1004,7 +1006,7 @@ class OpenAITest(unittest.TestCase):
             client.responses.create()
         self.assertEqual(captured.exception.reason, "protocol")
         self.assertNotification(errors, captured.exception)
-        self.assertEqual(client._subscription.state, "FAILED")
+        self.assertTrue(client._subscription.failed.is_set())
 
     def test_locally_closed_stream_is_not_changed_by_later_subscription_failure(self):
         client = self.client()
@@ -1023,14 +1025,23 @@ class OpenAITest(unittest.TestCase):
         head = self.result(first)
         self.received(client, head.seq)
         self.server.allow_start = False
-        self.server.streams[-1].queue.put(RpcError("UNAVAILABLE"))
-        sub = client._subscription
-        with sub.condition:
-            self.assertTrue(sub.condition.wait_for(lambda: sub.state == "DEGRADED", timeout=2))
-        second = client.responses.create(stream=True)
-        end = self.end(second, body="second")
-        self.server.accept()
-        self.received(client, end.seq)
+        reconnecting = threading.Event()
+        original_subscribe = self.server.subscribe
+
+        def subscribe(**kwargs):
+            replacement = original_subscribe(**kwargs)
+            reconnecting.set()
+            return replacement
+
+        with patch.object(self.server, "subscribe", side_effect=subscribe):
+            self.server.streams[-1].queue.put(RpcError("UNAVAILABLE"))
+            self.assertTrue(reconnecting.wait(2))
+            self.assertTrue(self.server.streams[0].cancelled)
+            self.assertFalse(self.server.streams[-1].accepted.is_set())
+            second = client.responses.create(stream=True)
+            end = self.end(second, body="second")
+            self.server.accept()
+            self.received(client, end.seq)
         self.assertEqual(self.server.status_count, 1)
         self.assertEqual(self.server.from_seqs, [0, head.seq])
         self.assertEqual(second.terminal_body, "second")
@@ -1047,6 +1058,26 @@ class OpenAITest(unittest.TestCase):
             next(stream)
         self.assertEqual(captured.exception.last_status, "PERMISSION_DENIED")
         self.assertEqual(len(self.server.streams), 1)
+
+    def test_reconnect_retry_exhaustion_does_not_start_another_round(self):
+        errors = []
+        client = self.client(max_retries=2, on_subscription_error=errors.append)
+        stream = client.responses.create(stream=True)
+        self.received(client, stream.request_seq)
+        self.server.start_errors = [RpcError("UNAVAILABLE") for _ in range(3)]
+        self.server.streams[-1].queue.put(RpcError("UNAVAILABLE"))
+        self.failed(client)
+        client._subscription.reader.join(2)
+        self.assertFalse(client._subscription.reader.is_alive())
+        with self.assertRaises(OpenEventSubscriptionError) as captured:
+            next(stream)
+        self.assertEqual(captured.exception.last_status, "UNAVAILABLE")
+        self.assertNotification(errors, captured.exception)
+        with self.assertRaises(OpenEventSubscriptionError):
+            client.responses.create(stream=True)
+        self.assertEqual(self.server.from_seqs, [0, *([stream.request_seq] * 3)])
+        self.assertEqual(self.server.status_count, 1)
+        self.assertTrue(all(item.cancelled for item in self.server.streams))
 
     def test_failed_client_and_stream_close_do_not_send_any_requests(self):
         client = self.client()
@@ -1323,7 +1354,8 @@ class OpenAITest(unittest.TestCase):
         self.assertEqual(captured.exception.status_code, 200)
         self.assertEqual(captured.exception.result_openevent_seq, 2)
         self.assertEqual(captured.exception.headers, [{"name": "x-request-id", "value": "malformed-result"}])
-        self.assertEqual(client._subscription.state, "READY")
+        self.assertFalse(client._subscription.failed.is_set())
+        self.assertFalse(self.server.streams[-1].cancelled)
 
     def test_initial_failure_callback_does_not_block_client_close(self):
         entered, release = threading.Event(), threading.Event()
