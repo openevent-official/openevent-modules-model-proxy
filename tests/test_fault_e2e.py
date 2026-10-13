@@ -95,7 +95,8 @@ class ObserveProcessedMessages:
 
     def __next__(self):
         previous, self.previous = self.previous, None
-        if previous is not None and previous.HasField("message"):
+        if (previous is not None and previous.HasField("message")
+                and previous.message.principal != 0):
             payload = support.parse_message(previous.message).payload
             with self.owner.condition:
                 self.owner.processed_messages[payload.kind, payload.stream_id] += 1

@@ -239,7 +239,7 @@ class EndToEndTests(unittest.TestCase):
     def messages(self):
         return [parse_message(m) for m in self.transport.fetch(
             principal=self.caller, token=self.caller_token, from_seq=1, limit=1000,
-            channels=[self.channel], only_my_recipient=False).messages]
+            channels=[self.channel], only_my_recipient=False).messages if m.principal != 0]
 
     def request(self, stream_id, *, stream=False, **body):
         return publish_infer_request(self.protocol, self.channel, self.caller, InferRequestInput(
@@ -403,7 +403,13 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(len(self.http.requests), before)
 
     def test_raw_cancel_from_other_member_is_terminal(self):
-        self.start_worker()
+        initial = self.transport.fetch(
+            principal=self.caller, token=self.caller_token, from_seq=1, limit=1000,
+            channels=[self.channel], only_my_recipient=False).messages
+        self.assertEqual(len(initial), 1)
+        self.assertEqual(initial[0].principal, 0)
+        self.assertEqual(json.loads(initial[0].payload)["kind"], "system.channel_initialized")
+        process = self.start_worker()
         client = self.openai()
         stream = client.responses.create(stream=True, test_mode="hold")
         next(stream)
@@ -416,6 +422,8 @@ class EndToEndTests(unittest.TestCase):
         with self.assertRaises(APIError) as error:
             list(stream)
         self.assertEqual(error.exception.status_code, 60004)
+        self.assertEqual(client.responses.create(input="after member change").answer, "ok")
+        self.assertIsNone(process.poll())
 
     def test_provider_header_timeout_has_correct_ordinary_and_stream_shape(self):
         self.start_worker(providers={"fake": {

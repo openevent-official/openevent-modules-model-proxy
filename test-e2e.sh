@@ -2,6 +2,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 export PYTHONDONTWRITEBYTECODE=1
+mkdir -p build/e2e build/pip-cache
+export TMPDIR="$PWD/build/e2e"
+export PIP_CACHE_DIR="$PWD/build/pip-cache"
 TASK_PYTHON="${PYTHON:-python3}"
 "$TASK_PYTHON" -B - <<'PY'
 import importlib.metadata
@@ -26,8 +29,6 @@ export OPENEVENT_SERVER_BIN="$TASK_SERVER"
 make build PYTHON="$TASK_PYTHON"
 rm -rf build/e2e-package
 "$TASK_PYTHON" -B -m pip install --no-deps --target build/e2e-package dist/openevent_model_proxy-*.whl
-mkdir -p build/e2e
-export TMPDIR="$PWD/build/e2e"
 export PYTHONPATH="$PWD/build/e2e-package:$PWD/tests"
 export OPENEVENT_RUN_E2E=1
 if [[ $# -gt 0 ]]; then

@@ -38,6 +38,17 @@ def request(seq, stream_id=None, *, stream=False, provider=None, body=None, chan
                                        provider=provider), channel=channel)
 
 
+def system_event(seq, kind="system.channel_initialized", **data):
+    if kind == "system.channel_initialized":
+        data = dict(name="model", protocol="llm.v1", visibility="protected", creator=7,
+                    members=[2, 7], description=json.dumps(
+                        {"version": "v1", "updated_at_ms": 0, "metadata": {}}))
+    return pb.EventMessage(
+        uuid=1000 + seq, seq=seq, channel_id=3, principal=0, ts_ms=seq + 10,
+        payload=json.dumps({"kind": kind, "data": {"schema_version": 1, **data}}).encode(),
+    )
+
+
 class RpcError(Exception):
     def __init__(self, status):
         self.status = status
@@ -284,6 +295,59 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(len(transport.subscribe_calls), 1)
         self.assertEqual(transport.subscribe_calls[0]["from_seq"], 0)
         self.assertEqual(transport.streams[0].started_timeouts, [100])
+        self.assertEqual(errors, [])
+        self.assertTrue(thread.is_alive())
+
+    def test_system_only_history_starts_worker_without_recovery_outputs(self):
+        transport = OpenEvent(history=[
+            system_event(1),
+            system_event(2, "system.member_added", member=9),
+            system_event(3, "system.member_removed", member=9),
+        ])
+        provider = ProviderFactory()
+        worker = Worker(config(), client=transport, provider_factory=provider)
+        thread, errors = self.start(worker)
+        self.assertTrue(worker.ready.wait(2))
+        self.assertEqual(worker.last_seen_seq, 3)
+        self.assertEqual(transport.subscribe_calls[0]["from_seq"], 3)
+        self.assertEqual(worker.requests, {})
+        self.assertEqual(worker.originals, set())
+        self.assertEqual(transport.published, [])
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(errors, [])
+        self.assertTrue(thread.is_alive())
+
+    def test_recovery_system_events_preserve_business_request_state(self):
+        transport = OpenEvent(history=[
+            system_event(1), request(2),
+            system_event(3, "system.member_added", member=9), request(4),
+            event(5, InferResultInput(stream_id="s4", prev_seq=4, status_code=200, body={})),
+            system_event(6, "system.member_removed", member=9),
+        ])
+        provider = ProviderFactory()
+        worker = Worker(config(), client=transport, provider_factory=provider)
+        worker.recover()
+        self.assertEqual(worker.last_seen_seq, 6)
+        self.assertEqual(worker.originals, {(3, "s2"), (3, "s4")})
+        outputs = [parse_payload(message.payload) for message in transport.published]
+        self.assertEqual([(output.prev_seq, output.status_code) for output in outputs], [(2, 60007)])
+        self.assertEqual(provider.calls, [])
+
+    def test_system_events_advance_reconnect_cursor_and_allow_new_requests(self):
+        removed = system_event(3, "system.member_removed", member=9)
+        first = Subscription([
+            system_event(2, "system.member_added", member=9), removed, RpcError("UNAVAILABLE"),
+        ])
+        second = Subscription([removed, request(4)])
+        transport = OpenEvent(history=[system_event(1)], subscriptions=[first, second])
+        provider = ProviderFactory(outputs=[ProviderEvent("result", 200, body={"answer": "ok"}, has_body=True)])
+        worker = Worker(config(), client=transport, provider_factory=provider)
+        thread, errors = self.start(worker)
+        self.assertTrue(transport.wait_published(1))
+        self.assertEqual([call["from_seq"] for call in transport.subscribe_calls], [1, 3])
+        self.assertEqual(len(provider.calls), 1)
+        output = parse_payload(transport.published[0].payload)
+        self.assertEqual((output.prev_seq, output.status_code, output.body), (4, 200, {"answer": "ok"}))
         self.assertEqual(errors, [])
         self.assertTrue(thread.is_alive())
 

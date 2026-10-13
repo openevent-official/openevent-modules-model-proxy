@@ -126,6 +126,8 @@ print(seq)
 
 ### 2.2 解析消息
 
+下面的 `message` 是已按[解析 API](SDK_API_cn.md#24-解析函数和模型)排除 OpenEvent 系统消息后的业务消息。
+
 ```python
 from openevent.model_proxy_sdk import InferAppend, InferResult, parse_message
 

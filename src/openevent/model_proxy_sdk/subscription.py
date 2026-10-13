@@ -303,6 +303,11 @@ class Subscription:
                 return False
             if raw.seq <= self.last_seen_seq:
                 return True
+            if raw.principal == 0:
+                # OpenEvent system messages share the cursor, not llm.v1 state.
+                self.last_seen_seq = raw.seq
+                self.condition.notify_all()
+                return True
         try:
             message = parse_message(raw)
         except Exception as exc:

@@ -81,6 +81,8 @@ parse_payload(payload: bytes) -> InferRequest | InferResult | InferAppend | Infe
 parse_message(message: EventMessage) -> ParsedMessage
 ```
 
+两个函数只解析 `llm.v1` 业务消息。直接消费 Fetch/Subscribe 时，系统消息的识别遵循
+[OpenEvent 系统协议](../openevent-sdk/docs/SYSTEM_PROTOCOL_cn.md#1-协议边界)。
 `parse_payload` 严格解析 UTF-8 JSON payload。`parse_message` 还返回 OpenEvent 消息元数据：
 
 ```text

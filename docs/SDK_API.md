@@ -90,6 +90,8 @@ parse_payload(payload: bytes) -> InferRequest | InferResult | InferAppend | Infe
 parse_message(message: EventMessage) -> ParsedMessage
 ```
 
+Both functions parse only `llm.v1` business messages. When consuming Fetch/Subscribe directly, identify
+system messages according to the [OpenEvent system protocol](../openevent-sdk/docs/SYSTEM_PROTOCOL.md#1-protocol-boundary).
 `parse_payload` strictly parses a UTF-8 JSON payload. `parse_message` also returns OpenEvent metadata:
 
 ```text

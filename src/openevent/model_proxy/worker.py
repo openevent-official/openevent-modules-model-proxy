@@ -231,7 +231,8 @@ class Worker:
                 if message.seq < cursor or message.seq <= previous:
                     raise WorkerFatalError("History is not ordered")
                 previous = message.seq
-                self._accept(self._parse(message), historical=True)
+                if message.principal != 0:
+                    self._accept(self._parse(message), historical=True)
             cursor = page.next_seq
             # The scan retains only request state, not completed Fetch pages.
             message = None
@@ -446,10 +447,12 @@ class Worker:
                         if message.seq <= self.last_seen_seq:
                             del message, response
                             continue
-                        parsed = self._parse(message)
-                        self._accept(parsed, payload_bytes=len(message.payload))
+                        if message.principal != 0:
+                            parsed = self._parse(message)
+                            self._accept(parsed, payload_bytes=len(message.payload))
+                            del parsed
                         self.last_seen_seq = message.seq
-                        del parsed, message, response
+                        del message, response
                     if not self.stopped.is_set():
                         raise ConnectionError("Subscribe ended without a terminal status")
                 except Exception as exc:

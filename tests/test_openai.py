@@ -1019,6 +1019,75 @@ class OpenAITest(unittest.TestCase):
         with self.assertRaises(OpenEventSubscriptionError):
             next(active)
 
+    def test_system_membership_events_do_not_interrupt_shared_streams(self):
+        errors = []
+        client = self.client(on_subscription_error=errors.append)
+        first = client.responses.create(stream=True, stream_id="first")
+        second = client.responses.create(stream=True, stream_id="second")
+        added = self.server.emit_raw(principal=0, recipients=(), payload=json.dumps({
+            "kind": "system.member_added", "data": {"schema_version": 1, "member": 3},
+        }).encode())
+        self.received(client, added.seq)
+        head = self.result(first)
+        self.server.emit("append", "first", request_seq=first.request_seq,
+                         prev_seq=head.seq, body="before removal")
+        removed = self.server.emit_raw(principal=0, recipients=(), payload=json.dumps({
+            "kind": "system.member_removed", "data": {"schema_version": 1, "member": 3},
+        }).encode())
+        self.received(client, removed.seq)
+        self.result(second)
+        self.end(second, body={"answer": "ready"})
+        end = self.end(first, body={"done": True})
+        self.received(client, end.seq)
+        self.assertEqual([chunk.body for chunk in first], ["before removal"])
+        self.assertEqual(first.terminal_body, {"done": True})
+        self.assertEqual(list(second), [])
+        self.assertEqual(second.terminal_body, {"answer": "ready"})
+        self.assertFalse(client._subscription.failed.is_set())
+        self.assertEqual(errors, [])
+
+    def test_system_message_advances_reconnect_cursor_without_parsing_payload(self):
+        client = self.client()
+        stream = client.responses.create(stream=True)
+        self.received(client, stream.request_seq)
+        system = self.server.emit_raw(principal=0, recipients=(), payload=json.dumps({
+            "kind": "system.member_added", "data": {"schema_version": 1, "member": 3},
+        }).encode())
+        self.received(client, system.seq)
+        reconnecting = threading.Event()
+        original_subscribe = self.server.subscribe
+
+        def subscribe(**kwargs):
+            replacement = original_subscribe(**kwargs)
+            reconnecting.set()
+            return replacement
+
+        with patch.object(self.server, "subscribe", side_effect=subscribe):
+            self.server.streams[-1].queue.put(RpcError("UNAVAILABLE"))
+            self.assertTrue(reconnecting.wait(2))
+            result = self.result(stream)
+            self.server.emit("append", stream.stream_id, request_seq=stream.request_seq,
+                             prev_seq=result.seq, body="after reconnect")
+            end = self.end(stream, body={"reconnected": True})
+            self.received(client, end.seq)
+        self.assertEqual(self.server.from_seqs, [0, system.seq])
+        self.assertEqual([chunk.body for chunk in stream], ["after reconnect"])
+        self.assertEqual(stream.terminal_body, {"reconnected": True})
+
+    def test_system_message_does_not_advance_cursor_after_subscription_failure(self):
+        client = self.client()
+        stream = client.responses.create(stream=True)
+        self.received(client, stream.request_seq)
+        self.server.streams[-1].queue.put(RpcError("PERMISSION_DENIED"))
+        self.failed(client)
+        sub = client._subscription
+        previous_seq = sub.last_seen_seq
+        system = self.server.emit_raw(principal=0, recipients=(), payload=json.dumps({
+            "kind": "system.member_added", "data": {"schema_version": 1, "member": 3},
+        }).encode())
+        self.assertFalse(sub._accept(system))
+        self.assertEqual(sub.last_seen_seq, previous_seq)
+
     def test_reconnect_replays_from_cursor_and_does_not_block_new_publish(self):
         client = self.client()
         first = client.responses.create(stream=True)

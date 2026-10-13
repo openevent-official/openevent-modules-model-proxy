@@ -130,6 +130,9 @@ See the [protocol SDK API](SDK_API.md#2-protocol-sdk) for the other input models
 
 ### 2.2 Parsing Messages
 
+The `message` below is a business message, after excluding OpenEvent system messages as described by the
+[parsing API](SDK_API.md#24-parsing-functions-and-models).
+
 ```python
 from openevent.model_proxy_sdk import InferAppend, InferResult, parse_message
 
