@@ -14,19 +14,23 @@ Committed means OpenEvent has durably stored the message, not that the model cal
 
 ## 1. Freezing Before Publication
 
-Each logical event uses one UUID. UUID allocation through the SDK's `get_uuid()` follows the
-[ordinary OpenEvent RPC retry rules](OPEN_EVENT_RPC_RETRY.md). Use only a successfully returned,
-valid nonzero UUID. A retry after a lost response may obtain another UUID; unreturned UUIDs remain
-unused gaps and are neither used for publishing nor reclaimed. Once the UUID is obtained, freeze:
+First generate and freeze the timestamp and complete payload bytes locally under the
+[SDK input-model and publication-preparation contract](SDK_API.md#22-input-models).
+An already prepared object supplies its frozen content directly, without re-encoding. This step allocates no UUID and issues no RPC.
 
-- Complete UTF-8 payload bytes, including the initially generated `kind` and `ts_ms`.
+Each logical event uses one UUID. Once publication begins, UUID allocation through the SDK's `get_uuid()` follows the
+[ordinary OpenEvent RPC retry rules](OPEN_EVENT_RPC_RETRY.md). Use the successfully returned UUID
+directly. A retry after a lost response may obtain another UUID; unreturned UUIDs remain
+unused gaps and are neither used for publishing nor reclaimed. Once the UUID is obtained, freeze the complete publication request:
+
+- The locally prepared UTF-8 payload bytes, including the already fixed `kind` and `ts_ms`.
 - Channel, publishing principal, and recipients; output events also include the request principal.
 - OpenEvent UUID.
 - All other request fields passed to `PublishAutoSeq`.
 
 Subsequent publishing attempts must reuse the same UUID and frozen request.
 If UUID allocation finally fails, do not call `PublishAutoSeq`; raise
-`ResultPublishError(commit_state=NOT_COMMITTED, event_uuid=None, committed_seq=None)`.
+`ResultPublishError(commit_state=NOT_COMMITTED, event_uuid=None)`.
 Populate `last_status` when a gRPC status is available.
 
 ## 2. PublishAutoSeq Flow
@@ -40,7 +44,7 @@ Publishing retries have their own counter.
 
 ### 2.1 Response Classification
 
-- `OK` with a valid positive integer seq: the event is committed; return that seq directly.
+- `OK`: the event is committed; return the seq from the response directly.
 - `ALREADY_EXISTS`: this attempt created no new message, and a previously committed message already
   consumed the UUID. Stop publishing and call `GetSeqByUuid` under Section 3 to obtain its seq.
 - `UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT`, or `RESOURCE_EXHAUSTED`:
@@ -63,9 +67,8 @@ the UUID. The SDK calls `GetSeqByUuid(uuid)` without scanning message history or
 All `GetSeqByUuid` attempt counts, waits, and error classifications follow the
 [ordinary OpenEvent RPC retry rules](OPEN_EVENT_RPC_RETRY.md), counted separately from `PublishAutoSeq`.
 
-- A successful lookup with a valid positive integer seq returns that committed seq and completes publication.
-- A lookup that finally fails under the ordinary RPC contract returns `commit_state=COMMITTED`
-  with `committed_seq=None`.
+- A successful lookup returns its committed seq directly and completes publication.
+- A lookup that finally fails under the ordinary RPC contract raises `ResultPublishError(commit_state=COMMITTED)`.
 
 Once UUID reconciliation starts, do not call `PublishAutoSeq` again or change UUIDs.
 
@@ -75,20 +78,17 @@ Once UUID reconciliation starts, do not call `PublishAutoSeq` again or change UU
 from openevent.model_proxy_sdk import CommitState, ResultPublishError
 ```
 
-Exception fields are read-only: `commit_state` is a `CommitState` enum, `event_uuid` and
-`committed_seq` have type `int | None`, and `last_status` has type `str | None`.
+Exception fields are read-only: `commit_state` is a `CommitState` enum, `event_uuid`
+has type `int | None`, and `last_status` has type `str | None`.
 
 - `commit_state`:
   - `NOT_COMMITTED`: the logical event is provably unpublished. Typical cases are failed UUID
     allocation, or publishing attempts that all returned definite uncommitted terminal outcomes
     without any uncertain attempt.
-  - `COMMITTED`: a committed message provably consumed the UUID, but no valid seq is currently
-    available to return.
+  - `COMMITTED`: a committed message provably consumed the UUID, but its seq has not been obtained.
   - `UNKNOWN`: at least one publishing attempt may have committed, and there is neither an obtained
     committed seq nor other proof of commitment.
 - `event_uuid`: populated after a UUID is successfully obtained and frozen; `None` on allocation failure.
-- `committed_seq`: the confirmed committed seq, or `None` when unknown. Normally, obtaining a valid
-  seq causes the publishing API to return it successfully.
 - `last_status`: the last observed gRPC or transport status, for diagnostics only; it cannot independently
   override the `commit_state` conclusion.
 

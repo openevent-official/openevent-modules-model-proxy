@@ -14,7 +14,7 @@ from .models import (
     ParsedMessage, UNSET, parse_message, parse_payload,
 )
 from .publishing import (
-    ModelProxyProtocolClient, create_client, publish_infer_append,
+    ModelProxyProtocolClient, PreparedPayload, create_client, prepare_payload, publish_infer_append,
     publish_infer_cancel, publish_infer_end, publish_infer_request,
     publish_infer_result,
 )

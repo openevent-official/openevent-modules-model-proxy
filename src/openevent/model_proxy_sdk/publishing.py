@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import time
 
+from . import _json
 from .errors import CommitState, ConfigurationError, PayloadValidationError, ResultPublishError
 from .models import (InferAppendInput, InferCancelInput, InferEndInput,
                      InferRequestInput, InferResultInput, positive_int)
@@ -30,6 +31,27 @@ def create_client(openevent_client, token, max_retries=3, retry_interval_ms=1000
 
 
 @dataclass(frozen=True)
+class PreparedPayload:
+    """One encoded event, created by prepare_payload without allocating a UUID."""
+
+    kind: str
+    stream_id: str
+    ts_ms: int
+    payload: bytes
+
+
+def prepare_payload(event):
+    """Freeze the SDK timestamp and payload once, without making an RPC."""
+    if not isinstance(event, (InferRequestInput, InferResultInput, InferAppendInput,
+                              InferEndInput, InferCancelInput)):
+        raise PayloadValidationError("INVALID_PUBLISH_ARGUMENT", "Expected an llm.v1 input model")
+    ts_ms = time.time_ns() // 1_000_000
+    data = event._data.copy()
+    data["ts_ms"] = ts_ms
+    return PreparedPayload(event.KIND, event.stream_id, ts_ms, _json.dump_bytes(data))
+
+
+@dataclass(frozen=True)
 class FrozenPublication:
     uuid: int
     payload: bytes
@@ -43,33 +65,27 @@ _NOT_COMMITTED = frozenset({"UNAUTHENTICATED", "PERMISSION_DENIED", "NOT_FOUND",
                             "INVALID_ARGUMENT", "RESOURCE_EXHAUSTED"})
 
 
-def _positive_reply(value, field):
-    if not positive_int(value):
-        raise RuntimeError(f"OpenEvent returned an invalid {field}")
-    return value
-
-
 def _publish(client, channel_id, principal, event, expected_type, *,
              request_principal=None, before_publish=None, validate_payload=None,
              before_rpc=None, stop_event=None):
-    if not isinstance(event, expected_type):
+    is_prepared = isinstance(event, PreparedPayload)
+    if not (event.kind == expected_type.KIND if is_prepared else isinstance(event, expected_type)):
         raise PayloadValidationError("INVALID_PUBLISH_ARGUMENT",
                                      f"Expected {expected_type.__name__}")
     if (not positive_int(channel_id) or not positive_int(principal)
             or (request_principal is not None and not positive_int(request_principal))):
         raise PayloadValidationError("INVALID_PUBLISH_ARGUMENT",
                                      "Channel and principals must be positive integers",
-                                     kind=event.KIND, stream_id=event.stream_id)
+                                     kind=expected_type.KIND, stream_id=event.stream_id)
     if not isinstance(client, ModelProxyProtocolClient):
         raise PayloadValidationError("INVALID_PUBLISH_ARGUMENT", "Invalid protocol client")
-    payload = event.to_payload(time.time_ns() // 1_000_000)
+    payload = (event if is_prepared else prepare_payload(event)).payload
     if validate_payload is not None:
         validate_payload(payload)
     recipients = () if request_principal is None else (request_principal,)
     transport = client.openevent_client
     try:
-        event_uuid = call_rpc(lambda: _positive_reply(transport.get_uuid(), "UUID"),
-                              client.max_retries, client.retry_interval_ms,
+        event_uuid = call_rpc(transport.get_uuid, client.max_retries, client.retry_interval_ms,
                               stop_event=stop_event, before_rpc=before_rpc)
     except RPCStopped:
         raise
@@ -98,12 +114,12 @@ def _publish(client, channel_id, principal, event, expected_type, *,
                 payload=frozen.payload, uuid=frozen.uuid, recipients=frozen.recipients,
                 object_keys=frozen.object_keys,
             )
-            return _positive_reply(response.seq, "seq")
+            return response.seq
         except Exception as exc:
             status = status_name(exc)
             if status == "ALREADY_EXISTS":
                 try:
-                    return call_rpc(lambda: _positive_reply(transport.get_seq_by_uuid(frozen.uuid), "seq"),
+                    return call_rpc(lambda: transport.get_seq_by_uuid(frozen.uuid),
                                     client.max_retries, client.retry_interval_ms,
                                     stop_event=stop_event, before_rpc=before_rpc)
                 except RPCStopped:

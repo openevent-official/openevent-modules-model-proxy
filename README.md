@@ -18,8 +18,9 @@ and writes results back to the same OpenEvent channel.
 
 - Protocol version: `llm.v1`
 - Python version: `>=3.10`
-- OpenEvent SDK: `openevent-sdk>=0.11.1`
+- OpenEvent SDK: `openevent-sdk>=0.13.0`
 - YAML parser: `PyYAML>=6.0`
+- JSON codec: `msgspec>=0.19.0`
 - Provider type: `openai_compatible`; see the [llm.v1 compatibility requirements](docs/LLM_PROTOCOL.md#41-minimum-openai_compatible-contract)
 - Endpoints: `POST /v1/chat/completions` and `POST /v1/responses`, both with ordinary and streaming calls
 - Python API: protocol message construction, parsing, and publishing, plus an OpenAI-like synchronous client
@@ -51,6 +52,7 @@ project package unchanged. Select the Python environment with `PYTHON`; `INSTALL
 index and network options such as `--find-links`, but cannot change the destination or dependency
 replacement policy.
 
+Before testing, use `make install` to install this project and satisfy its runtime dependencies.
 Tests use the SDK already installed in the current environment without installing from the
 submodule. The `packaging` test tool checks its version:
 

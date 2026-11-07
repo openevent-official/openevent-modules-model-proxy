@@ -8,8 +8,8 @@
 stores opaque payloads, assigns global `seq` values and message `uuid` values, enforces Channel ACLs,
 and provides Fetch/Subscribe. It does not interpret this protocol.
 
-The protocol assumes callers use the SDK and follow the principal, recipients, stream_id, and
-single-writer constraints. It adds no business authorization, does not guarantee that a request
+Publishers and result consumers must follow this protocol and the principal, recipients, stream_id, and
+single-writer constraints. The protocol adds no business authorization, does not guarantee that a request
 calls the provider only once, and defines no business retry semantics.
 
 ## 2. Channels and OpenEvent Fields
@@ -18,13 +18,11 @@ Every model Channel MUST set `protocol="llm.v1"` and use protected or private vi
 Its description is a JSON string with this shape:
 
 ```json
-{"version":"v1","updated_at_ms":1710000000000,"metadata":{}}
+{"metadata":{}}
 ```
 
-The decoded description must be a JSON object containing exactly the three required fields
-`version`, `updated_at_ms`, and `metadata`. `version` must be the string `"v1"`; `updated_at_ms`
-must be a nonnegative integer, with `bool` excluded; `metadata` must be a JSON object whose
-contents are application-defined.
+The decoded description must be a JSON object containing only the required field `metadata`.
+`metadata` must be a JSON object whose contents are application-defined.
 
 A Channel is one Model Proxy session domain, bound by deployment configuration to exactly one
 running Worker. Both callers and the Worker must be members. A request has an empty OpenEvent
@@ -36,8 +34,8 @@ Top-level OpenEvent fields retain their native meanings:
 - `seq` is an immutable global position and the value referenced by `prev_seq`.
 - `recipients` only filters delivery; it is neither an ACL nor a confidentiality boundary.
 - `uuid` is a server-allocated message ID, distinct from both `stream_id` and `request_seq`. When a
-  PublishAutoSeq result is uncertain, the same UUID must be reused as specified in the
-  [single-event reliable publishing contract](RESULT_PUBLISHING.md).
+  PublishAutoSeq result is uncertain, retries must reuse the same UUID and frozen message content.
+  Commit and UUID lookup semantics follow the [OpenEvent API contract](../openevent-sdk/docs/API.md).
 
 ## 3. JSON and Message Fields
 
@@ -49,7 +47,7 @@ it is listed as required or optional for that message kind.
 | --- | --- |
 | `kind` | string; one of `infer.request`, `infer.result`, `infer.append`, `infer.end`, or `infer.cancel` |
 | `stream_id` | string; caller-generated call identifier; length `1..128`, with every character in ASCII `[A-Za-z0-9._:-]` |
-| `ts_ms` | integer, `>= 0`, with no additional upper bound; Unix millisecond timestamp generated and frozen by the publisher |
+| `ts_ms` | integer, `>= 0`; Unix millisecond timestamp generated and frozen by the publisher |
 | `provider` | nonempty string; field validity does not depend on whether the Worker currently configures that name |
 | `method` | string; only `POST` |
 | `path` | string; only `/v1/chat/completions` or `/v1/responses` |
@@ -58,14 +56,14 @@ it is listed as required or optional for that message kind.
 | `status_code` | integer; Provider HTTP status `100..599`, or a Model Proxy status code explicitly listed in Section 7 |
 | `headers` | nonempty array; each element is an object containing exactly `name` and `value`, both strings; `name` must be a lowercase name allowed by Section 5 |
 | `end_status` | string; only `completed`, `failed`, or `interrupted` |
-| `body` | must be an object in `infer.request`; allowed JSON types and omission rules for other messages are listed below |
+| `body` | must be an object when present; follows the OpenAI API contract in Section 4.1 or the Model Proxy error structure in Section 7; omission rules are listed below |
 
 | `kind` | Required fields | Optional fields | `body` rule |
 | --- | --- | --- | --- |
 | `infer.request` | `kind`, `stream_id`, `ts_ms`, `method`, `path`, `body` | `provider`, `prev_seq` | Must be an object; `stream`, when present, must be boolean |
-| `infer.result` | `kind`, `stream_id`, `ts_ms`, `prev_seq`, `status_code` | `headers`, `body` | Any JSON value; an absent `body` differs from `body: null` |
-| `infer.append` | `kind`, `stream_id`, `ts_ms`, `request_seq`, `prev_seq`, `body` | None | Any JSON value |
-| `infer.end` | `kind`, `stream_id`, `ts_ms`, `request_seq`, `status_code`, `end_status` | `body` | Optional for `completed`; required for `failed` and `interrupted`; any JSON value |
+| `infer.result` | `kind`, `stream_id`, `ts_ms`, `prev_seq`, `status_code` | `headers`, `body` | Object; present in an ordinary terminal result and omitted in a streaming chain head |
+| `infer.append` | `kind`, `stream_id`, `ts_ms`, `request_seq`, `prev_seq`, `body` | None | Object; a streaming event for the corresponding endpoint |
+| `infer.end` | `kind`, `stream_id`, `ts_ms`, `request_seq`, `status_code`, `end_status` | `body` | Object; optional for `completed`, required for `failed` and `interrupted` |
 | `infer.cancel` | `kind`, `stream_id`, `ts_ms`, `request_seq` | None | No `body` |
 
 Strict parsing checks that the payload is a UTF-8 JSON object, its field set, JSON types, and all value
@@ -125,18 +123,19 @@ produces no result, and does not enter the `stream_id` deduplication state.
 
 An `openai_compatible` Provider must satisfy these rules:
 
-1. The Provider accepts JSON object requests at `POST /v1/chat/completions` and `POST /v1/responses`.
-   Model Proxy forwards the request `body` unchanged; it does not validate model names, message contents,
-   or other business fields on the Provider's behalf.
+1. Requests, responses, and streaming events for `POST /v1/chat/completions` and `POST /v1/responses`
+   follow the fields and values defined by the corresponding OpenAI API. Model Proxy reads only the fields
+   needed by this protocol and does not duplicate full OpenAI schema validation. The Provider validates model
+   names, message contents, and other request fields.
 2. When `body.stream` is absent or `false`, the Provider returns a complete HTTP response. Its body
-   must be a complete UTF-8 JSON value, for both HTTP success and HTTP error responses.
+   must be a complete UTF-8 JSON object, for both HTTP success and HTTP error responses.
 3. When `body.stream=true`, the Provider may return UTF-8 SSE with the `Content-Type` media type
    `text/event-stream`. Chat Completions ends normally with `[DONE]`; Responses ends with
    `response.completed`, `response.failed`, or `response.incomplete`. Each Responses SSE data event must be a JSON object
    with a string `type` naming an event in the
    [official OpenAI event definitions](https://developers.openai.com/api/reference/resources/responses/streaming-events).
    Section 6 defines SSE parsing and terminal mapping.
-4. A streaming request may also receive a complete non-SSE JSON response; Model Proxy records it as
+4. A streaming request may also receive a complete non-SSE JSON object response; Model Proxy records it as
    a streaming terminal event under Section 6.
 5. The Provider must return a valid HTTP status code and parseable response headers. Model Proxy records
    only the response headers listed in Section 5; other headers are not observable `llm.v1` results.
@@ -196,9 +195,9 @@ The Worker principal publishes results with only the request principal in recipi
 request determines the result shape:
 
 1. A valid non-streaming request uses its first matching result as the terminal response, and that result
-   must contain `body`. JSON `null` is an explicitly present body, not an omission. If the first matching
-   result has no `body`, the call reports a protocol error; the consumer cannot skip it for a later result.
-   Regardless of `Content-Type`, the provider body must decode as one complete JSON value. A decoding
+   must contain `body`. If the first matching result has no `body`, the call reports a protocol error;
+   the consumer cannot skip it for a later result. Regardless of `Content-Type`, the provider body must
+   be one complete JSON object. A decoding
    failure after the Provider input size check produces an ordinary terminal result under Section 5.1.
 2. For a streaming request that passes the duplicate, size, and provider configuration checks and enters
    the Provider call, any result published must omit `body`. Unless the Worker has already observed a
@@ -220,14 +219,14 @@ never produces `infer.end`. The mapping is:
 
 | Provider stage | `status_code` | `body` and headers |
 | --- | --- | --- |
-| HTTP response received with status `100..599` | Original Provider HTTP status | Preserve the JSON-decodable response body unchanged and retain headers under the forwarding rules. HTTP 4xx/5xx is still an ordinary terminal result; callers identify failure from the status. |
+| HTTP response received with status `100..599` | Original Provider HTTP status | Forward the response body conforming to Section 4.1 and retain headers under the forwarding rules. HTTP 4xx/5xx is still an ordinary terminal result; callers identify failure from the status. |
 | Timeout while waiting for response headers | `60000` | Standard Model Proxy error body; no provider response headers. |
 | Explicit DNS resolution failure | `60001` | Standard Model Proxy error body; no provider response headers. |
 | Explicit TLS handshake failure | `60002` | Standard Model Proxy error body; no provider response headers. |
 | Explicit connection failure or reset before response headers | `60003` | Standard Model Proxy error body; no provider response headers. |
 | No-progress timeout reading the body after response headers | `60000` | Discard the incomplete body and headers; write the standard Model Proxy error body. |
 | Connection reset or premature end while reading the body after response headers | `60003` | Discard the incomplete body and headers; write the standard Model Proxy error body. |
-| Response received, but body is not complete JSON or UTF-8/parsing fails | `60007` | Discard the raw body and headers; write the standard Model Proxy error body. |
+| Response received, but body is not a complete JSON object or UTF-8/parsing fails | `60007` | Discard the raw body and headers; write the standard Model Proxy error body. |
 | Output payload exceeds `max_payload_bytes` | `60008` | Discard the oversized provider body and headers; write a small standard error body that fits the limit. |
 
 Section 7 maps the standard Model Proxy error body's `error.code` to status codes. These failures do not
@@ -281,17 +280,17 @@ create no append: Chat Completions `[DONE]` is not written to a body; Responses 
 preserved unchanged in the end's `body`.
 
 If a streaming request receives an ordinary HTTP response instead of `text/event-stream`, the Worker
-first decodes its complete body as JSON regardless of `Content-Type`. On successful decoding, this is
-the provider terminal response and becomes one completed `infer.end` containing that JSON body, without
+first checks that its complete body is a JSON object regardless of `Content-Type`. If that check succeeds,
+this is the provider terminal response and becomes one completed `infer.end` containing that body, without
 an append. Both the bodyless result and completed end carry the HTTP status; consumers still treat
 non-2xx statuses as provider HTTP errors.
 
-The project's minimum Chat Completions and Responses compatibility contract requires JSON responses,
-including error responses. A non-event body that cannot decode as JSON is therefore a Provider response
+The project's minimum Chat Completions and Responses compatibility contract requires JSON object responses,
+including error responses. A non-event body that cannot decode as a JSON object is therefore a Provider response
 parsing failure, not a compatible response. The Worker discards the raw body and writes a
 `60007 interrupted` end with the standard error body. If a bodyless result was already written, it retains the
 observed HTTP status and headers while the end uses `60007`; otherwise, the Worker writes the end directly.
-Every non-terminal event in an event stream must also be valid JSON. Invalid event JSON produces the
+Every non-terminal event in an event stream must also be a valid JSON object. Invalid event JSON produces the
 same `60007 interrupted` end. Neither path exposes the raw body to callers.
 
 ### 6.2 infer.end

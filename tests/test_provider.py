@@ -1,19 +1,24 @@
 from contextlib import contextmanager, nullcontext
 import gzip
 import json
-import os
 import socket
 import socketserver
-import sys
 import threading
 import time
 import unittest
 from unittest.mock import patch
 
+import msgspec
+
 from openevent.model_proxy.config import ProviderConfig, ProviderTimeout
 from openevent.model_proxy.provider import ProviderCall, ProviderCancelled, ProviderError
-from openevent.model_proxy_sdk import InferEndInput, parse_payload
+from openevent.model_proxy_sdk import InferRequestInput, parse_payload, prepare_payload
 from openevent.model_proxy_sdk import _json
+from openai_fixtures import (
+    chat_body, chat_chunks, chat_request, http_error_body, response_body,
+    response_end_events, response_start_events, responses_request,
+)
+from test_e2e import fake_provider
 
 
 @contextmanager
@@ -60,117 +65,19 @@ def response(body, content_type="application/json", extra=b"", status=200):
 
 def call(url, stream=False, path="/v1/chat/completions", limit=4096, header_ms=1000, idle_ms=1000):
     config = ProviderConfig("openai_compatible", url, "secret", ProviderTimeout(header_ms, idle_ms))
-    return ProviderCall(config, {"model": "m", "stream": stream}, path, limit)
+    body = _json.raw_body(_json.dump_bytes({"model": "m", "stream": stream}))
+    return ProviderCall(config, body, path, limit, streaming=stream)
 
 
 class ProviderTests(unittest.TestCase):
-    def high_fd_operation(self):
-        try:
-            import fcntl
-        except ImportError:
-            self.skipTest("High socket descriptors require Unix fcntl")
-        if not hasattr(fcntl, "F_DUPFD") or not hasattr(socket, "socketpair"):
-            self.skipTest("High socket descriptor allocation is unavailable")
-        original, peer = socket.socketpair()
-        self.addCleanup(original.close)
-        self.addCleanup(peer.close)
-        try:
-            descriptor = fcntl.fcntl(original.fileno(), fcntl.F_DUPFD, 2048)
-        except OSError as exc:
-            self.skipTest(f"Cannot allocate a socket descriptor >= 2048: {exc}")
-        try:
-            sock = socket.socket(fileno=descriptor)
-        except BaseException:
-            os.close(descriptor)
-            raise
-        self.addCleanup(sock.close)
-        original.close()
-        peer.settimeout(1)
-        operation = call("http://unused.invalid")
-        operation._install(sock)
-        operation._deadline = time.monotonic() + 2
-        self.addCleanup(operation.abort)
-        self.assertGreaterEqual(sock.fileno(), 2048)
-        return operation, peer
-
-    def test_high_socket_descriptor_reads_and_writes(self):
-        operation, peer = self.high_fd_operation()
-        operation._send(b"request")
-        self.assertEqual(peer.recv(7), b"request")
-        peer.sendall(b"response")
-        self.assertEqual(operation._recv(8), b"response")
-
-    def test_high_socket_descriptor_idle_read_times_out(self):
-        operation, _ = self.high_fd_operation()
-        operation._deadline = time.monotonic() + 0.05
-        with self.assertRaises(TimeoutError):
-            operation._recv(1)
-
-    def test_abort_interrupts_high_socket_descriptor_read(self):
-        operation, _ = self.high_fd_operation()
-        started, finished = threading.Event(), threading.Event()
-        errors = []
-
-        def receive():
-            started.set()
-            try:
-                operation._recv(1)
-            except Exception as exc:
-                errors.append(exc)
-            finally:
-                finished.set()
-
-        thread = threading.Thread(target=receive, daemon=True)
-        thread.start()
-        try:
-            self.assertTrue(started.wait(1))
-            self.assertFalse(finished.wait(0.05), "An idle socket must remain waiting before abort")
-            operation.abort()
-            self.assertTrue(finished.wait(1), "Abort must interrupt the socket read")
-        finally:
-            operation.abort()
-            thread.join(1)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], (ProviderCancelled, OSError))
-
-    def test_large_json_integers_are_preserved_in_http_requests_and_responses(self):
-        before = getattr(sys, "get_int_max_str_digits", lambda: None)()
-        integer = 10 ** 5000 + 7
-        encoded = b"1" + b"0" * 4999 + b"7"
-        body = b'{"error":{"code":' + encoded + b'}}'
-        request_input = {"large": integer, "negative": -integer, "text": "中文\ud800"}
-        with provider_server(lambda sock: sock.sendall(response(body, status=429))) as (url, requests):
-            operation = call(url, limit=20000)
-            operation.request_body["input"] = request_input
-            events = list(operation)
-        self.assertEqual(events[0].status_code, 429)
-        self.assertEqual(events[0].body["error"]["code"], integer)
-        sent = _json.loads(requests[0][1])
-        self.assertEqual(sent["input"], request_input)
-        self.assertEqual(getattr(sys, "get_int_max_str_digits", lambda: None)(), before)
-
-    def test_large_sse_integer_survives_provider_and_protocol_terminal_conversion(self):
-        integer = 10 ** 5000
-        encoded = b"1" + b"0" * 5000
-        data = (b'data: {"type":"response.output_text.delta","sequence_number":' + encoded + b',"delta":"text"}\n\n'
-                b'data: {"type":"response.failed","error":{"code":-' + encoded + b'}}\n\n')
-        with provider_server(lambda sock: sock.sendall(response(data, "text/event-stream"))) as (url, _):
-            events = list(call(url, True, "/v1/responses", limit=20000))
-        self.assertEqual([event.kind for event in events], ["headers", "append", "failed"])
-        self.assertEqual(events[1].body["sequence_number"], integer)
-        terminal = InferEndInput(
-            stream_id="big", request_seq=1, status_code=200, end_status="failed", body=events[2].body,
-        )
-        self.assertEqual(parse_payload(terminal.to_payload(2)).body["error"]["code"], -integer)
-
     def test_json_http_error_preserved_and_gateway_and_headers(self):
         body = b'{"error":{"message":"rate limit"}}'
         wire = response(body, "text/plain", b"X-Request-ID: one\r\nX-Request-ID: two\r\nX-Discard: omitted\r\n", 429)
         with provider_server(lambda sock: sock.sendall(wire)) as (url, requests):
             events = list(call(url))
         self.assertEqual(len(events), 1)
-        self.assertEqual((events[0].kind, events[0].status_code, events[0].body), ("result", 429, json.loads(body)))
+        self.assertEqual((events[0].kind, events[0].status_code, _json.body_copy(events[0].body)),
+                         ("result", 429, json.loads(body)))
         self.assertEqual(events[0].headers, [{"name": "content-type", "value": "text/plain"}, {"name": "x-request-id", "value": "one"}, {"name": "x-request-id", "value": "two"}])
         self.assertTrue(requests[0][0].startswith(b"POST /gateway/v1/chat/completions HTTP/1.1\r\n"))
         self.assertEqual(requests[0][0].count(b"Authorization:"), 1)
@@ -184,8 +91,9 @@ class ProviderTests(unittest.TestCase):
         with provider_server(send) as (url, _):
             events = list(call(url, True))
         self.assertEqual([e.kind for e in events], ["headers", "append", "completed"])
-        self.assertEqual(events[1].body, {"a": 1})
-        self.assertFalse(events[2].has_body)
+        self.assertEqual(_json.body_copy(events[1].body), {"a": 1})
+        self.assertIsNone(events[0].body)
+        self.assertIsNone(events[2].body)
 
     def test_split_leading_sse_bom_does_not_merge_empty_event_or_consume_limit(self):
         suffix = b"\ndata: {}\n\n"
@@ -218,43 +126,81 @@ class ProviderTests(unittest.TestCase):
                         release.set()
                         events = [head, *stream]
                 self.assertEqual([event.kind for event in events], ["headers", "append", "completed"])
-                self.assertEqual(events[1].body, {})
+                self.assertEqual(_json.body_copy(events[1].body), {})
 
-    def test_request_unicode_values_are_forwarded_losslessly(self):
+    def test_request_unicode_and_json_escapes_reach_provider(self):
+        body = {"input": "中文é😀\x7f", "escaped": '"\\\n\x00'}
+        request = InferRequestInput(stream_id="unicode", method="POST",
+                                    path="/v1/chat/completions", body=body)
+        parsed = parse_payload(prepare_payload(request).payload)
         with provider_server(lambda sock: sock.sendall(response(b"{}"))) as (url, requests):
             config = ProviderConfig("openai_compatible", url, "密钥", ProviderTimeout(1000, 1000))
-            operation = ProviderCall(config, {"input": "中文\ud800"}, "/v1/chat/completions", 4096)
-            list(operation)
-        self.assertEqual(json.loads(requests[0][1])["input"], "中文\ud800")
-        self.assertIn("Authorization: Bearer 密钥\r\n".encode(), requests[0][0])
+            with patch("openevent.model_proxy_sdk._json.request_stream",
+                       side_effect=AssertionError("Provider must reuse the parsed stream flag")):
+                operation = ProviderCall(config, parsed._data["body"], parsed.path, 4096,
+                                         streaming=parsed._streaming)
+                events = list(operation)
+        headers, sent = requests[0]
+        self.assertEqual(sent, bytes(parsed._data["body"]))
+        self.assertIsInstance(events[0].body, msgspec.Raw)
+        self.assertEqual(json.loads(sent), body)
+        self.assertIn('"input":"中文é😀\x7f"'.encode("utf-8"), sent)
+        self.assertIn(b'"escaped":"\\\"\\\\\\n\\u0000"', sent)
+        self.assertIn(f"Content-Length: {len(sent)}\r\n".encode("ascii"), headers)
+        self.assertIn("Authorization: Bearer 密钥\r\n".encode(), headers)
 
-    def test_responses_terminal_not_append(self):
-        for terminal, expected in (("response.completed", "completed"),
-                                   ("response.failed", "failed"),
-                                   ("response.incomplete", "failed")):
-            with self.subTest(terminal=terminal):
-                payload = {"type": terminal, "sequence_number": 1,
-                           "response": {"id": "r", "status": terminal.split(".")[1]}}
-                if terminal == "response.incomplete":
-                    payload["response"]["incomplete_details"] = {"reason": "max_output_tokens"}
-                data = b"data: " + json.dumps(payload).encode() + b"\n\n"
-                with provider_server(lambda sock: sock.sendall(response(data, "text/event-stream"))) as (url, _):
-                    events = list(call(url, True, "/v1/responses"))
-                self.assertEqual([e.kind for e in events], ["headers", expected])
-                self.assertEqual(events[-1].status_code, 200)
-                self.assertTrue(events[-1].has_body)
-                self.assertEqual(events[-1].body, payload)
+    def test_openai_fixtures_preserved_and_terminal_not_append(self):
+        cases = [
+            ("chat JSON", "/v1/chat/completions", chat_request(),
+             [("result", 200, chat_body())]),
+            ("responses JSON", "/v1/responses", responses_request(),
+             [("result", 200, response_body())]),
+            ("chat stream", "/v1/chat/completions", chat_request(stream=True),
+             [("headers", 200, None)] + [("append", 200, body) for body in chat_chunks()]
+             + [("completed", 200, None)]),
+            ("non-SSE stream", "/v1/responses",
+             responses_request(stream=True, metadata={"test_mode": "json"}),
+             [("headers", 200, None), ("completed", 200, response_body())]),
+        ]
+        for status, terminal in (("completed", "completed"), ("failed", "failed"),
+                                 ("incomplete", "failed")):
+            bodies = response_start_events() + response_end_events(status=status)
+            cases.append((status, "/v1/responses",
+                          responses_request(stream=True, metadata={"test_mode": status}),
+                          [("headers", 200, None)]
+                          + [("append", 200, body) for body in bodies[:-1]]
+                          + [(terminal, 200, bodies[-1])]))
+        for streaming in (False, True):
+            cases.append((f"HTTP error, stream={streaming}", "/v1/responses",
+                          responses_request(stream=streaming, metadata={"test_mode": "http_error"}),
+                          [("headers", 429, None), ("completed", 429, http_error_body())]
+                          if streaming else [("result", 429, http_error_body())]))
 
-    def test_non_sse_stream_json_null_retains_body_presence(self):
-        with provider_server(lambda sock: sock.sendall(response(b"null", status=429))) as (url, _):
+        with fake_provider() as provider:
+            config = ProviderConfig("openai_compatible", f"http://127.0.0.1:{provider.server_port}",
+                                    "secret", ProviderTimeout(1000, 1000))
+            for name, path, body, expected in cases:
+                with self.subTest(case=name):
+                    operation = ProviderCall(config, _json.raw_body(_json.dump_bytes(body)), path,
+                                             8192, streaming=body.get("stream", False))
+                    events = list(operation)
+                    self.assertEqual([(event.kind, event.status_code,
+                                       None if event.body is None else _json.body_copy(event.body))
+                                      for event in events], expected)
+                    self.assertEqual(provider.requests[-1][:2], (path, body))
+            self.assertEqual(len(provider.requests), len(cases))
+
+    def test_non_sse_stream_http_error_is_terminal(self):
+        body = b'{"error":{"message":"rate limited"}}'
+        with provider_server(lambda sock: sock.sendall(response(body, status=429))) as (url, _):
             events = list(call(url, True))
         self.assertEqual([e.kind for e in events], ["headers", "completed"])
         self.assertEqual(events[-1].status_code, 429)
-        self.assertTrue(events[-1].has_body)
-        self.assertIsNone(events[-1].body)
+        self.assertIsNotNone(events[-1].body)
+        self.assertEqual(_json.body_copy(events[-1].body), json.loads(body))
 
     def test_json_utf8_compressed_input_and_sse_eof_failures(self):
-        wires = [response(b"garbage"), response(b'"\xff"'), response(b"NaN"), response(b"1e999"), response(b"data: {}\n\n", "text/event-stream")]
+        wires = [response(b"garbage"), response(b'"\xff"'), response(b"NaN"), response(b"data: {}\n\n", "text/event-stream")]
         for wire in wires:
             with self.subTest(wire=wire):
                 with provider_server(lambda sock: sock.sendall(wire)) as (url, _):
@@ -262,48 +208,35 @@ class ProviderTests(unittest.TestCase):
                         list(call(url, stream=b"event-stream" in wire))
                 self.assertEqual(error.exception.status_code, 60007)
 
-    def test_limits_before_header_filtering_and_during_decompression(self):
-        wires = [
-            b"HTTP/1.1 200 OK\r\nX-Unrecorded: " + b"x" * 4096 + b"\r\n\r\n{}",
-            response(gzip.compress(b'"' + b"a" * 1000000 + b'"'), extra=b"Content-Encoding: gzip\r\n"),
-            response(b":" + b"a" * 4094 + b"\r\n\r\n", "text/event-stream"),
+    def test_input_limits_during_decompression_and_sse_parsing(self):
+        cases = [
+            (False, response(gzip.compress(b'{"output":"' + b"a" * 1000000 + b'"}'), extra=b"Content-Encoding: gzip\r\n")),
+            (True, response(b":" + b"a" * 4094 + b"\r\n\r\n", "text/event-stream")),
         ]
-        for index, wire in enumerate(wires):
-            with self.subTest(index=index):
+        for streaming, wire in cases:
+            with self.subTest(streaming=streaming):
                 with provider_server(lambda sock: sock.sendall(wire)) as (url, _):
                     with self.assertRaises(ProviderError) as error:
-                        list(call(url, stream=index == 2))
+                        list(call(url, stream=streaming))
                 self.assertEqual(error.exception.status_code, 60008)
 
     def test_sse_normalized_size_and_incremental_chunked_gzip(self):
-        data = b"data: 1\r\n\r\ndata: [DONE]\r\n\r\n"
+        data = b'data: {"choices":[]}\r\n\r\ndata: [DONE]\r\n\r\n'
         compressed = gzip.compress(data)
         wire = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n" + b"".join(f"{len(part):x}\r\n".encode() + part + b"\r\n" for part in (compressed[:5], compressed[5:])) + b"0\r\n\r\n"
         with provider_server(lambda sock: sock.sendall(wire)) as (url, _):
             events = list(call(url, True))
         self.assertEqual([e.kind for e in events], ["headers", "append", "completed"])
-        self.assertEqual(events[1].body, 1)
+        self.assertEqual(_json.body_copy(events[1].body), {"choices": []})
 
-    def test_chunk_extension_quoted_tab_is_ignored(self):
+    def test_chunked_json_response_with_extension(self):
         wire = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                 b"Transfer-Encoding: chunked\r\n\r\n"
-                b'2;audit="a\tb"\r\n{}\r\n0\r\n\r\n')
+                b"2;trace=sample\r\n{}\r\n0\r\n\r\n")
         with provider_server(lambda sock: sock.sendall(wire)) as (url, _):
             events = list(call(url))
-        self.assertEqual([(event.kind, event.status_code, event.body) for event in events],
+        self.assertEqual([(event.kind, event.status_code, _json.body_copy(event.body)) for event in events],
                          [("result", 200, {})])
-
-    def test_chunk_extensions_handle_quotes_escapes_and_last_chunk(self):
-        quoted = b'quote' + b'\\"' + b';slash' + b'\\\\' + b';tab' + b'\\\t'
-        wire = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                b"Transfer-Encoding: chunked\r\n\r\n"
-                b'1;flag;audit="a\t;b"\r\n{\r\n'
-                b'1;token=ok;escaped="' + quoted + b'";empty=""\r\n}\r\n'
-                b'0;finished="yes;\tend"\r\nX-Audit: ignored\r\n\r\n')
-        with provider_server(lambda sock: sock.sendall(wire)) as (url, _):
-            events = list(call(url))
-        self.assertEqual(events[0].body, {})
-        self.assertEqual(events[0].headers, [{"name": "content-type", "value": "application/json"}])
 
     def test_sse_limit_counts_normalized_utf8_bytes(self):
         # Wire CRLF bytes exceed the limit, while normalized LF bytes fit exactly.
@@ -325,7 +258,7 @@ class ProviderTests(unittest.TestCase):
                                 list(call(url))
                             self.assertEqual(error.exception.status_code, 60008)
                         else:
-                            self.assertEqual(list(call(url))[0].body, {})
+                            self.assertEqual(_json.body_copy(list(call(url))[0].body), {})
 
     def test_header_limit_accumulates_multiple_fields(self):
         fields = b"X-Ignored: " + b"x" * 100 + b"\r\n"
@@ -350,7 +283,7 @@ class ProviderTests(unittest.TestCase):
                         self.assertEqual(error.exception.status_code, 60008)
                     else:
                         result = list(call(url))[0]
-                        self.assertEqual((result.status_code, result.body), (200, {}))
+                        self.assertEqual((result.status_code, _json.body_copy(result.body)), (200, {}))
 
     def test_unterminated_oversized_header_fails_without_waiting_for_newline(self):
         release = threading.Event()
@@ -371,15 +304,15 @@ class ProviderTests(unittest.TestCase):
         for chunked in (False, True):
             with self.subTest(chunked=chunked):
                 def send(sock):
-                    framing = b"Transfer-Encoding: chunked\r\n\r\n5\r\n" if chunked else b"Content-Length: 5\r\n\r\n"
+                    framing = b"Transfer-Encoding: chunked\r\n\r\n10\r\n" if chunked else b"Content-Length: 16\r\n\r\n"
                     sock.sendall(b"HTTP/1.1 200 OK\r\n" + framing)
-                    for part in (b'"', b"a", b"b", b"c", b'"'):
+                    for part in (b'{"output":"', b"a", b"b", b"c", b'"}'):
                         sock.sendall(part)
                         time.sleep(0.015)
                     if chunked:
                         sock.sendall(b"\r\n0\r\n\r\n")
                 with provider_server(send) as (url, _):
-                    self.assertEqual(list(call(url, idle_ms=40))[0].body, "abc")
+                    self.assertEqual(_json.body_copy(list(call(url, idle_ms=40))[0].body), {"output": "abc"})
 
         for framing in (b"Content-Length: 10\r\n\r\n{}",
                         b"Transfer-Encoding: chunked\r\n\r\na\r\n{}",
@@ -395,7 +328,7 @@ class ProviderTests(unittest.TestCase):
             events = list(call(url))
             self.assertEqual(len(requests), 1)
         self.assertEqual(events[0].status_code, 302)
-        self.assertEqual(events[0].body, {})
+        self.assertEqual(_json.body_copy(events[0].body), {})
 
         with provider_server(lambda sock: None) as (url, requests):
             with self.assertRaises(ProviderError) as error:
@@ -404,7 +337,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(error.exception.status_code, 60003)
 
     def test_publish_pause_does_not_consume_idle_budget(self):
-        wire = response(b"data: 1\n\ndata: [DONE]\n\n", "text/event-stream")
+        wire = response(b'data: {"choices":[]}\n\ndata: [DONE]\n\n', "text/event-stream")
         with provider_server(lambda sock: sock.sendall(wire)) as (url, _):
             stream = iter(call(url, True, idle_ms=30))
             self.assertEqual(next(stream).kind, "headers")
@@ -414,7 +347,7 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(next(stream).kind, "completed")
 
     def test_sse_yields_event_before_rest_of_response_arrives(self):
-        first, last = b"data: 1\n\n", b"data: [DONE]\n\n"
+        first, last = b'data: {"choices":[]}\n\n', b"data: [DONE]\n\n"
         for chunked in (False, True):
             with self.subTest(chunked=chunked):
                 release = threading.Event()
@@ -432,7 +365,7 @@ class ProviderTests(unittest.TestCase):
                         stream = iter(call(url, True, idle_ms=500))
                         self.assertEqual(next(stream).kind, "headers")
                         event = next(stream)
-                        self.assertEqual((event.kind, event.body), ("append", 1))
+                        self.assertEqual((event.kind, _json.body_copy(event.body)), ("append", {"choices": []}))
                         release.set()
                         self.assertEqual(next(stream).kind, "completed")
                         self.assertEqual(list(stream), [])

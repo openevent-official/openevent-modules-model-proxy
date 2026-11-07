@@ -1,16 +1,15 @@
 """One reader and one lock for a client's subscribed calls.
 
-Publishing is deliberately outside this module: the caller registers a frozen
-request before publishing, and later supplies the publisher's final conclusion.
+Publishing is deliberately outside this module: the caller registers its request
+UUID before publishing, and later supplies the publisher's final conclusion.
 """
 
 from collections import deque
 from dataclasses import dataclass, field
 import logging
 import threading
-from weakref import WeakSet
 
-from .errors import OpenEventSubscriptionError, ProtocolError, _copy_error
+from .errors import OpenEventSubscriptionError, _copy_error
 from .models import parse_message
 from .rpc import RPCStopped, call_rpc, is_retryable, status_name
 
@@ -36,7 +35,7 @@ class ProtocolFault:
 class Call:
     stream_id: str
     streaming: bool
-    frozen: object = None
+    pending_uuid: int | None = None
     request_seq: int | None = None
     receive: ReceiveState | None = None
     queue: deque = field(default_factory=deque)
@@ -69,7 +68,6 @@ class Subscription:
         self.active_subscribe = None
         self.calls_by_uuid = {}
         self.receives_by_seq = {}
-        self.calls = WeakSet()
         self.error = None
 
     def _check_locked(self):
@@ -123,9 +121,7 @@ class Subscription:
     def begin(self, stream_id, streaming):
         with self.condition:
             self._check_locked()
-            call = Call(stream_id, streaming)
-            self.calls.add(call)
-            return call
+            return Call(stream_id, streaming)
 
     def begin_publication_rpc(self):
         with self.condition:
@@ -134,26 +130,16 @@ class Subscription:
             # This lock boundary starts one RPC attempt. The RPC itself runs
             # outside the lock and may finish after failure has been recorded.
 
-    def register(self, call, frozen):
+    def register(self, call, uuid: int):
         with self.condition:
-            if call.error is not None:
-                raise _copy_error(call.error)
             self._check_locked()
-            if frozen.uuid in self.calls_by_uuid:
-                raise RuntimeError("Request UUID is already registered")
-            call.frozen = frozen
-            self.calls_by_uuid[frozen.uuid] = call
+            call.pending_uuid = uuid
+            self.calls_by_uuid[uuid] = call
 
     def published(self, call, seq):
-        failure = None
         with self.condition:
             call.request_seq = seq
-            if call.receive is not None and call.receive.request_seq != seq:
-                error = self._request_error(call, "Published request seq differs from subscribed request")
-                self._invalidate_locked(call, error)
-                failure = self._fail_locked(error)
             self.condition.notify_all()
-        self._finish_failure(failure)
 
     def publication_failed(self, call):
         with self.condition:
@@ -164,31 +150,17 @@ class Subscription:
             self.condition.notify_all()
 
     def _detach_locked(self, call):
-        if call.frozen is not None:
-            self.calls_by_uuid.pop(call.frozen.uuid, None)
-            call.frozen = None
+        if call.pending_uuid is not None:
+            self.calls_by_uuid.pop(call.pending_uuid, None)
+            call.pending_uuid = None
         if call.receive is not None:
             self.receives_by_seq.pop(call.receive.request_seq, None)
-        # Keep receive to check a publication result that arrives later.
+        # Keep the accepted terminal state available to stream.close().
 
     def stop_call_locked(self, call):
         call.local_closed = True
         self._detach_locked(call)
         self.condition.notify_all()
-
-    def _invalidate_locked(self, call, error):
-        self._detach_locked(call)
-        call.queue.clear()
-        call.result = call.completed = None
-        call.error = _copy_error(error)
-        call.local_closed = True
-
-    def _request_error(self, call, message):
-        return OpenEventSubscriptionError(
-            message, reason="protocol", protocol_error=ProtocolError(
-                message, stream_id=call.stream_id, request_seq=call.request_seq,
-            ),
-        )
 
     def _fail_locked(self, error):
         if self.error is not None:
@@ -196,13 +168,11 @@ class Subscription:
         error = _copy_error(error)
         self.error = error
         self.failed.set()
-        for call in list(self.calls):
-            if not call.local_closed and (call.receive is None or not call.receive.terminal):
-                if call.error is None:
-                    call.error = error
-            call.frozen = None
-        self.calls_by_uuid.clear()
-        self.receives_by_seq.clear()
+        for calls in (self.calls_by_uuid, self.receives_by_seq):
+            for call in calls.values():
+                call.error = error
+                call.pending_uuid = None
+            calls.clear()
         self.condition.notify_all()
         return error, self.active_subscribe
 
@@ -221,8 +191,6 @@ class Subscription:
             return
         error, stream = failure
         self._cancel(stream)
-        if self.reader is not None and self.reader is not threading.current_thread():
-            self.reader.join()
         if self.on_error is not None:
             try:
                 self.on_error(_copy_error(error))
@@ -320,44 +288,24 @@ class Subscription:
                 failure = self._fail_locked(error)
             self._finish_failure(failure)
             return False
-        failure = None
         with self.condition:
             if self.failed.is_set():
                 return False
             payload = message.payload
             if payload.kind == "infer.request":
-                call = self.calls_by_uuid.get(message.uuid)
+                call = self.calls_by_uuid.pop(message.uuid, None)
                 if call is not None:
-                    frozen = call.frozen
-                    same = (
-                        message.seq > 0 and message.uuid == frozen.uuid
-                        and message.channel_id == frozen.channel_id
-                        and message.principal == frozen.principal
-                        and tuple(message.recipients) == frozen.recipients
-                        and tuple(message.object_keys) == frozen.object_keys
-                        and bytes(raw.payload) == frozen.payload
-                        and (call.request_seq is None or call.request_seq == message.seq)
-                    )
-                    if not same:
-                        error = self._request_error(call, "Subscribed request differs from frozen publication")
-                        self._invalidate_locked(call, error)
-                        failure = self._fail_locked(error)
-                    else:
-                        call.receive = ReceiveState(message.seq, message.seq)
-                        self.receives_by_seq[message.seq] = call
-                        del self.calls_by_uuid[frozen.uuid]
-                        # Publication retries independently own this message.
-                        call.frozen = None
+                    call.receive = ReceiveState(message.seq, message.seq)
+                    self.receives_by_seq[message.seq] = call
+                    call.pending_uuid = None
             else:
                 request_seq = payload.prev_seq if payload.kind == "infer.result" else payload.request_seq
                 call = self.receives_by_seq.get(request_seq)
                 if call is not None and payload.stream_id == call.stream_id:
                     self._accept_output_locked(call, message)
-            if failure is None:
-                self.last_seen_seq = message.seq
+            self.last_seen_seq = message.seq
             self.condition.notify_all()
-        self._finish_failure(failure)
-        return failure is None
+        return True
 
     def _accept_output_locked(self, call, message):
         payload, receive = message.payload, call.receive

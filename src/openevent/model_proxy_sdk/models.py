@@ -5,7 +5,9 @@ from dataclasses import dataclass
 import math
 import re
 
-from . import _json as json
+import msgspec
+
+from . import _json
 from .errors import PayloadValidationError
 
 
@@ -72,7 +74,8 @@ def _valid_json(value, active=None):
         active.remove(id(value))
 
 
-def _validate(data, *, decoded_json=False):
+def _validate(data):
+    """Validate one message and return its request mode, if applicable."""
     if type(data) is not dict:
         raise PayloadValidationError("INVALID_PAYLOAD", "Payload must be a JSON object")
     kind = data.get("kind")
@@ -105,17 +108,23 @@ def _validate(data, *, decoded_json=False):
         fail("INVALID_METHOD", "method must be POST")
     if "path" in data and data["path"] not in ("/v1/chat/completions", "/v1/responses"):
         fail("INVALID_PATH", "Unsupported request path")
-    if "body" in data and not decoded_json:
-        try:
-            valid_body = _valid_json(data["body"])
-        except RecursionError:
-            valid_body = False
-        if not valid_body:
-            fail("INVALID_BODY", "body must be a finite JSON value")
-    if kind == "infer.request":
+    streaming = None
+    if "body" in data:
         body = data["body"]
-        if type(body) is not dict or ("stream" in body and type(body["stream"]) is not bool):
-            fail("INVALID_BODY", "request body must be an object; stream must be boolean")
+        try:
+            if isinstance(body, msgspec.Raw):
+                if kind == "infer.request":
+                    streaming = _json.request_stream(body)
+                else:
+                    _json.validate_body(body)
+            elif type(body) is not dict or not _valid_json(body):
+                fail("INVALID_BODY", "body must be a JSON object")
+            elif kind == "infer.request":
+                streaming = body.get("stream", False)
+                if type(streaming) is not bool:
+                    fail("INVALID_BODY", "request stream must be boolean")
+        except (msgspec.DecodeError, RecursionError) as exc:
+            fail("INVALID_BODY", str(exc))
     if "headers" in data:
         headers = data["headers"]
         if type(headers) is not list or not headers:
@@ -144,17 +153,19 @@ def _validate(data, *, decoded_json=False):
             valid = type(status) is int and status in _INTERRUPTED_CODES
         if not valid:
             fail("INVALID_STATUS_CODE", "status_code is not allowed for this message shape")
+    return streaming
 
 
 class _Model:
-    __slots__ = ("_data",)
+    __slots__ = ("_data", "_streaming")
     KIND = None
 
     def __init__(self, data):
-        _validate(data)
+        streaming = _validate(data)
         if data["kind"] != self.KIND:
             raise PayloadValidationError("INVALID_KIND", "Wrong model kind")
         object.__setattr__(self, "_data", deepcopy(data))
+        object.__setattr__(self, "_streaming", streaming)
 
     def __setattr__(self, name, value):
         raise AttributeError(f"{type(self).__name__} is read-only")
@@ -163,11 +174,14 @@ class _Model:
         if name == "has_body" and self.KIND in ("infer.result", "infer.end"):
             return "body" in self._data
         if name in _REQUIRED[self.KIND] | _OPTIONAL[self.KIND]:
+            if name == "body":
+                return _json.body_copy(self._data.get(name))
             return deepcopy(self._data.get(name))
         raise AttributeError(name)
 
     def to_dict(self):
-        return deepcopy(self._data)
+        return {key: _json.body_copy(value) if key == "body" else deepcopy(value)
+                for key, value in self._data.items()}
 
     def __repr__(self):
         return f"{type(self).__name__}({self._data!r})"
@@ -204,12 +218,6 @@ class _Input(_Model):
     def _initialize(self, fields):
         data = {"kind": self.KIND, "ts_ms": 0, **fields}
         _Model.__init__(self, data)
-
-    def to_payload(self, ts_ms):
-        data = self._data.copy()
-        data["ts_ms"] = ts_ms
-        return json.dumps(data, ensure_ascii=True, allow_nan=False,
-                          separators=(",", ":")).encode("utf-8")
 
 
 class InferRequestInput(_Input):
@@ -266,31 +274,25 @@ class InferCancelInput(_Input):
         self._initialize(dict(stream_id=stream_id, request_seq=request_seq))
 
 
-def _reject_constant(value):
-    raise ValueError(f"Non-finite JSON number: {value}")
-
-
-def _parse_float(value):
-    number = float(value)
-    if not math.isfinite(number):
-        _reject_constant(value)
-    return number
-
-
 def parse_payload(payload):
     try:
         if not isinstance(payload, bytes):
             raise ValueError("payload must be bytes")
-        data = json.loads(payload.decode("utf-8"), parse_constant=_reject_constant,
-                          parse_float=_parse_float)
-    except (UnicodeError, ValueError, TypeError, RecursionError) as exc:
+        payload.decode("utf-8")
+        fields = msgspec.json.decode(payload, type=dict[str, msgspec.Raw])
+        data = {key: value.copy() if key == "body" else msgspec.json.decode(value)
+                for key, value in fields.items()}
+    except msgspec.ValidationError as exc:
+        raise PayloadValidationError("INVALID_PAYLOAD", "Payload must be a JSON object") from exc
+    except (msgspec.DecodeError, UnicodeError, ValueError, TypeError, RecursionError) as exc:
         raise PayloadValidationError("INVALID_JSON", "payload must be valid UTF-8 JSON") from exc
     models = {"infer.request": InferRequest, "infer.result": InferResult,
               "infer.append": InferAppend, "infer.end": InferEnd, "infer.cancel": InferCancel}
-    _validate(data, decoded_json=True)
-    # Decoding created an independent JSON tree; the parsed model owns it.
+    streaming = _validate(data)
+    # Only the envelope is decoded. The body owns its independent byte slice.
     model = object.__new__(models[data["kind"]])
     object.__setattr__(model, "_data", data)
+    object.__setattr__(model, "_streaming", streaming)
     return model
 
 

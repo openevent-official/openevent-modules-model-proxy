@@ -3,6 +3,7 @@
 from copy import deepcopy
 from enum import Enum
 
+from . import _json
 
 class ConfigurationError(ValueError):
     pass
@@ -34,14 +35,12 @@ class CommitState(Enum):
 class ResultPublishError(Exception):
     commit_state = _field("commit_state")
     event_uuid = _field("event_uuid")
-    committed_seq = _field("committed_seq")
     last_status = _field("last_status")
 
-    def __init__(self, message="", *, commit_state, event_uuid=None,
-                 committed_seq=None, last_status=None):
+    def __init__(self, message="", *, commit_state, event_uuid=None, last_status=None):
         super().__init__(message or f"Event publication failed: {commit_state.value}")
         self._values = dict(commit_state=commit_state, event_uuid=event_uuid,
-                            committed_seq=committed_seq, last_status=last_status)
+                            last_status=last_status)
 
 
 class APIError(Exception):
@@ -61,7 +60,8 @@ class APIError(Exception):
         if unknown:
             raise TypeError(f"Unknown error context: {sorted(unknown)}")
         super().__init__(message or type(self).__name__)
-        self._values = {name: deepcopy(context.get(name)) for name in fields}
+        self._values = {name: _json.body_copy(context.get(name)) if name == "body"
+                        else deepcopy(context.get(name)) for name in fields}
 
 
 class APIStatusError(APIError):

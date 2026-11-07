@@ -56,12 +56,24 @@ InferEndInput(*, stream_id, request_seq, status_code, end_status, body=UNSET)
 InferCancelInput(*, stream_id, request_seq)
 ```
 
-`UNSET` omits the JSON field and differs from Python `None`. For example,
-`InferResultInput(body=UNSET)` creates a bodyless streaming chain head, while
-`InferResultInput(body=None)` creates an ordinary terminal result with `"body": null`.
-Input models do not accept `kind` or `ts_ms`; the corresponding publishing function generates
-and freezes them. Field types, ranges, and allowed combinations are defined only by the protocol.
+`UNSET` omits the JSON field. For example, `InferResultInput(body=UNSET)` creates a bodyless streaming
+chain head. Supply a Python `dict` conforming to the protocol when a body is present; `None` is not a valid body.
+Input models do not accept `kind` or `ts_ms`; the SDK generates and freezes them when preparing publication.
+Field types, ranges, and allowed combinations are defined only by the protocol.
 `provider=None` and a request's `prev_seq=None` omit those fields; `headers=None` omits headers.
+
+To inspect the actual bytes before sending, prepare the payload once:
+
+```python
+prepare_payload(event) -> PreparedPayload
+```
+
+`event` must be one of the five input models above. The factory generates the current Unix millisecond timestamp and freezes the complete payload,
+returning a read-only object with `kind: str`, `stream_id: str`, `ts_ms: int`, and `payload: bytes`.
+Use only factory-returned objects; do not construct or modify them manually. The object retains neither the original body nor an OpenEvent UUID;
+preparation does not modify the input model, allocate a UUID, or issue RPCs. `payload` contains complete UTF-8 JSON bytes conforming to `llm.v1`,
+preserving the contents of valid field values in the input model. After inspecting `prepared.payload`, pass that same `PreparedPayload` to the corresponding publishing function,
+which sends the bytes that were checked.
 
 ### 2.3 Publishing Functions
 
@@ -74,10 +86,16 @@ publish_infer_cancel(client, channel_id, principal, cancel) -> int
 ```
 
 Each function returns the message's committed OpenEvent `seq`. Arguments that violate `llm.v1`
-during input-model construction or publication raise `PayloadValidationError` before any OpenEvent
+during input-model construction, payload preparation, or publication raise `PayloadValidationError` before any OpenEvent
 call. After validation succeeds, the function returns successfully only when publishing-related RPCs
 obtain that seq; final publishing failure raises `ResultPublishError`. The caller supplies no OpenEvent
 message UUID and cannot replace the function's result with a message observed through Subscribe.
+
+Each event argument accepts either its corresponding input model or a `PreparedPayload`; a prepared object's `kind` must match the publishing function.
+Input models automatically pass through `prepare_payload` inside the function. Prepared objects reuse their `ts_ms` and `payload` without re-encoding.
+Each publishing-function call still allocates its own OpenEvent UUID. Retries within that call reuse this UUID and the same bytes under the
+[reliable publishing contract](RESULT_PUBLISHING.md). `PreparedPayload` is an encoded in-memory input, not a retry handle across calls or restarts.
+Passing the same object to a publishing function again starts another publication; it cannot resume an earlier call with an uncertain commit outcome.
 
 For result, append, and end, `request_principal` is the OpenEvent principal that published the original
 request; publishing functions use it to set output recipients. Request and cancel recipients are empty.
@@ -109,7 +127,9 @@ ParsedMessage.ts_ms
 [OpenEvent API contract](../openevent-sdk/docs/API.md). `ParsedMessage.payload.ts_ms` is the timestamp
 written into the payload by the protocol publisher. The five read-only payload models are
 `InferRequest`, `InferResult`, `InferAppend`, `InferEnd`, and `InferCancel`.
-`InferResult.has_body` and `InferEnd.has_body` distinguish an absent body from JSON null.
+`InferResult.has_body` and `InferEnd.has_body` indicate whether the message contains a body.
+Parsing expands only the fields needed by the protocol. Reading a model's `body` or calling `to_dict()`
+converts the body to Python objects and returns an independent copy.
 
 Strict parsing failures raise `PayloadValidationError`:
 
@@ -177,7 +197,7 @@ arguments outside the signature raise `TypeError`.
 `on_subscription_error` is invoked synchronously once per instance on final subscription failure,
 with the `OpenEventSubscriptionError` defined in Section 5. Triggers include a permanent error or
 exhausted retries during the first `GetStatus`, Subscribe establishment, reading, or reconnection,
-and message-parsing or request-consistency failures. Temporary faults still being retried do not
+and message-parsing failures. Temporary faults still being retried do not
 notify; faults caused by closing the underlying connection follow the same rules.
 The callback reports that the instance has stopped receiving new messages; individual calls receive
 errors according to Section 5. Callback exceptions are logged without replacing the subscription
@@ -230,9 +250,9 @@ headers
 model_dump()
 ```
 
-`body` retains the complete Provider JSON value, including null, arrays, and scalars. `model_dump()`
-returns a copy of the equivalent JSON value. Object bodies support recursive read-only attribute
-access. If a Provider field conflicts with a fixed SDK attribute, the SDK attribute takes precedence;
+`body` and `model_dump()` return Python `dict` copies of the corresponding OpenAI response object,
+which also supports recursive read-only attribute access. The SDK converts the body to Python objects
+only on the first read of the body or a Provider field. If a Provider field conflicts with a fixed SDK attribute, the SDK attribute takes precedence;
 the original Provider field remains accessible through `body`.
 
 ### 3.4 Streaming Return Object
@@ -252,11 +272,11 @@ can determine their values, without waiting for the caller to execute `next()` o
 | `response_status_code` | Status code of that same result; updated together with the property above. |
 | `response_headers` | Response headers of that same result; updated together with the properties above. |
 | `terminal_has_body` | Whether the accepted end with `end_status="completed"` contains a body; determined when the subscription thread accepts that message. |
-| `terminal_body` | The end's complete JSON body, including JSON null, when the preceding property is `True`; `None` when it is `False`; updated together with that property. |
+| `terminal_body` | A Python `dict` copy of the end's body when the preceding property is `True`; `None` when it is `False`; readable together with that property. The body is converted when read. |
 
 Corresponding properties are `None` until the relevant result or completed end has been accepted.
 A completed end without a body gives `terminal_has_body=False` and `terminal_body=None`.
-A completed end with a JSON null body gives `terminal_has_body=True` and `terminal_body=None`.
+A completed end with a body gives `terminal_has_body=True`.
 Other terminal outcomes do not set these two completed-end properties.
 
 Information received before publication completes is readable as soon as the stream is returned.
@@ -360,9 +380,7 @@ protocol_error: ProtocolError | PayloadValidationError | None
 
 `reason="rpc"` means GetStatus or Subscribe establishment, reading, or reconnection finally failed;
 `last_status` holds the last available gRPC status. `reason="protocol"` means a subscribed message
-cannot be parsed, or a request published by this instance appears in the subscription with content
-that conflicts with its frozen request or the seq returned by the publishing RPC. Here,
-`protocol_error` retains the specific error's type, message, and public diagnostic fields, and `last_status`
+cannot be parsed. Here, `protocol_error` retains the specific error's type, message, and public diagnostic fields, and `last_status`
 is `None`. A parseable message that only breaks a target call's result shape or append chain gives
 that call a `ProtocolError` without failing the whole Subscribe.
 
@@ -383,10 +401,10 @@ without sending further RPCs to obtain more evidence:
 | --- | --- |
 | First Publish has not started and UUID allocation succeeds | The request returns the saved subscription error; the cancel closes locally without Publish. |
 | In-flight UUID allocation fails | Original `ResultPublishError(NOT_COMMITTED)`, with `event_uuid=None`, without retrying. |
-| In-flight Publish or UUID lookup returns a valid seq | Preserve successful publication and that seq without restoring the subscription or starting other requests. |
-| Publish returns `ALREADY_EXISTS` before lookup starts | `ResultPublishError(COMMITTED)`, with `committed_seq=None`, without lookup. |
+| In-flight Publish or UUID lookup succeeds and returns a seq | Preserve successful publication and that seq without restoring the subscription or starting other requests. |
+| Publish returns `ALREADY_EXISTS` before lookup starts | `ResultPublishError(COMMITTED)`, without lookup. |
 | In-flight Publish fails, or its retry wait is stopped | Return `NOT_COMMITTED` or `UNKNOWN` using existing evidence under the publishing contract, without retrying. |
-| Lookup after confirmed `ALREADY_EXISTS` fails, or its retry is stopped | `ResultPublishError(COMMITTED)`, with `committed_seq=None`. |
+| Lookup after confirmed `ALREADY_EXISTS` fails, or its retry is stopped | `ResultPublishError(COMMITTED)`. |
 
 This section applies only to requests initiated by this OpenAI-like instance. Independent protocol SDK
 clients and Workers continue to follow their own publishing contracts.
@@ -395,10 +413,7 @@ Final shared-subscription failure stops receipt of new messages. Already receive
 first. Calls with an existing terminal event end according to it; calls without one receive the saved
 `OpenEventSubscriptionError` after existing output has been delivered. If the request is still
 publishing, first determine the publishing conclusion under Section 3.2: only successful publication
-uses these received results; publishing failure still returns the original publishing error. If the
-error identifies a request that conflicts with its frozen content or the returned publishing seq,
-that call's buffered results cannot be delivered; after successful publication, the call still ends
-with this subscription error.
+uses these received results; publishing failure still returns the original publishing error.
 
 Final failure of the first `GetStatus` occurs before request publication and directly returns
 `OpenEventSubscriptionError`.

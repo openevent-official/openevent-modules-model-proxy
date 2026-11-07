@@ -51,10 +51,22 @@ InferEndInput(*, stream_id, request_seq, status_code, end_status, body=UNSET)
 InferCancelInput(*, stream_id, request_seq)
 ```
 
-`UNSET` 表示不生成该 JSON 字段；它与 Python `None` 不同。例如 `InferResultInput(body=UNSET)` 生成不带 body 的
-流式链头，`InferResultInput(body=None)` 生成带 `"body": null` 的普通终态。输入模型不接收 `kind` 和 `ts_ms`；
-对应发布函数自动生成并冻结这两个字段。各字段的类型、范围和组合限制只看协议文档。
+`UNSET` 表示不生成该 JSON 字段。例如 `InferResultInput(body=UNSET)` 生成不带 body 的流式链头；
+提供 body 时应传入符合协议的 Python `dict`，`None` 不是合法 body。输入模型不接收 `kind` 和 `ts_ms`；
+SDK 在准备发布时自动生成并冻结这两个字段。各字段的类型、范围和组合限制只看协议文档。
 `provider=None` 和 request 的 `prev_seq=None` 表示省略对应字段；`headers=None` 表示省略 headers。
+
+需要在发送前检查实际字节时，先准备一次 payload：
+
+```python
+prepare_payload(event) -> PreparedPayload
+```
+
+`event` 必须是上述五种输入模型之一。工厂生成当前 Unix 毫秒时间戳并冻结完整 payload，返回只读对象，字段为
+`kind: str`、`stream_id: str`、`ts_ms: int`、`payload: bytes`。只能使用工厂返回的对象，不能手工构造或修改。
+对象不保留原始 body 或 OpenEvent UUID；准备过程不修改输入模型、不分配 UUID、不发起 RPC。
+`payload` 是符合 `llm.v1` 的完整 UTF-8 JSON bytes，保留输入模型中合法字段值的内容。
+调用方检查 `prepared.payload` 后，将同一 `PreparedPayload` 交给对应发布函数，发送的就是已检查的字节。
 
 ### 2.3 发布函数
 
@@ -66,9 +78,15 @@ publish_infer_end(client, channel_id, principal, request_principal, event) -> in
 publish_infer_cancel(client, channel_id, principal, cancel) -> int
 ```
 
-返回值是本次消息提交后的 OpenEvent `seq`。构造输入模型或发布时发现参数不符合 `llm.v1`，会在调用 OpenEvent 前抛出
+返回值是本次消息提交后的 OpenEvent `seq`。构造输入模型、准备 payload 或发布时发现参数不符合 `llm.v1`，会在调用 OpenEvent 前抛出
 `PayloadValidationError`。输入校验通过后，函数只在发布相关 RPC 取得该 seq 时成功返回；发布流程最终失败时抛出
 `ResultPublishError`。调用方不传 OpenEvent 消息 UUID，也不能从 Subscribe 消息替代发布函数的返回值。
+
+上述函数的事件参数均接受对应的输入模型或 `PreparedPayload`；冻结对象的 `kind` 必须匹配所调用的发布函数。
+输入模型会在函数内部自动调用 `prepare_payload`；已准备对象直接复用 `ts_ms` 和 `payload`，不重新编码。
+每次发布函数调用仍独立分配 OpenEvent UUID。同一次调用内的重试复用该 UUID 和同一份字节，具体规则见
+[可靠发布契约](RESULT_PUBLISHING_cn.md)。`PreparedPayload` 只是内存中的已编码输入，不是跨调用或重启的重试句柄；
+把同一对象再次传给发布函数会开始另一次发布，不能用来接回提交结果不确定的旧调用。
 
 result、append 和 end 的 `request_principal` 是原 request 的 OpenEvent 发布 principal，发布函数据此设置输出消息的
 recipients。request 和 cancel 的 recipients 为空。`channel_id`、`principal` 和 `request_principal` 必须是正整数，
@@ -99,7 +117,8 @@ ParsedMessage.ts_ms
 `ParsedMessage.ts_ms` 是 OpenEvent 服务端收到发布请求的时间，语义以
 [OpenEvent API 契约](../openevent-sdk/docs/API_cn.md)为准；`ParsedMessage.payload.ts_ms` 是协议发布方写入 payload 的时间。
 五种只读 payload 模型分别是 `InferRequest`、`InferResult`、`InferAppend`、`InferEnd` 和 `InferCancel`。
-`InferResult.has_body` 和 `InferEnd.has_body` 用于区分 body 缺失和 JSON null。
+`InferResult.has_body` 和 `InferEnd.has_body` 表示消息是否包含 body。
+解析时仅展开协议所需字段；读取模型的 `body` 或调用 `to_dict()` 时才把正文转换为 Python 对象，并返回独立副本。
 
 严格解析失败时抛出 `PayloadValidationError`：
 
@@ -162,7 +181,7 @@ Subscribe 没有整个流的 deadline。`max_retries` 和 `retry_interval_ms` �
 
 `on_subscription_error` 在共享订阅最终失败时，每个实例同步调用一次，参数为第 5 节定义的
 `OpenEventSubscriptionError`。触发条件包括首次 `GetStatus`、Subscribe 建立、读取或重连遇到永久错误或耗尽重试，
-以及消息解析或请求一致性检查失败；暂时故障仍在重试时不通知。关闭底层连接引起的故障遵循相同规则。
+以及消息解析失败；暂时故障仍在重试时不通知。关闭底层连接引起的故障遵循相同规则。
 回调通知实例已停止接收新消息，各调用的异常交付时机见第 5 节。回调抛错只记录，不替换订阅错误；
 回调可以关闭同一客户端，`close()` 不等待回调退出。
 
@@ -204,8 +223,8 @@ headers
 model_dump()
 ```
 
-`body` 保留完整 Provider JSON 值，包括 null、数组或标量；`model_dump()` 返回等价的 JSON 值副本。body 是 object
-时可以递归使用只读属性访问。若 Provider 字段与 SDK 固定属性同名，SDK 固定属性优先，原始 Provider 字段仍可从
+`body` 和 `model_dump()` 返回对应 OpenAI 响应 object 的 Python `dict` 副本，并支持递归只读属性访问。
+SDK 在首次读取正文或 Provider 字段时才将正文转换为 Python 对象。若 Provider 字段与 SDK 固定属性同名，SDK 固定属性优先，原始 Provider 字段仍可从
 `body` 读取。
 
 ### 3.4 流式返回对象
@@ -223,11 +242,11 @@ model_dump()
 | `response_status_code` | 与上项同一条 result 的状态码，与上项一起更新。 |
 | `response_headers` | 与上项同一条 result 的响应头，与上项一起更新。 |
 | `terminal_has_body` | 被接受的 `end_status="completed"` 的 end 是否包含 body，由订阅线程接受该消息时确定。 |
-| `terminal_body` | 上项为 `True` 时保留该 end 的完整 JSON body，包括 JSON null；上项为 `False` 时为 `None`，与上项一起更新。 |
+| `terminal_body` | 上项为 `True` 时返回该 end 的 body 的 Python `dict` 副本；上项为 `False` 时为 `None`，与上项一起可读。正文在读取时转换。 |
 
 尚未接受对应 result 或 completed end 时，相应属性为 `None`。没有 body 的 completed end 对应
-`terminal_has_body=False`、`terminal_body=None`；带有 JSON null body 的 completed end 对应
-`terminal_has_body=True`、`terminal_body=None`。其他终态不设置这两个 completed end 属性。
+`terminal_has_body=False`、`terminal_body=None`；带 body 的 completed end 对应 `terminal_has_body=True`。
+其他终态不设置这两个 completed end 属性。
 
 发布完成前已收到的信息在返回流对象时直接可读。属性读取不等待消息、不消费队列；已确定的信息不会因迭代、关闭、
 订阅失败、重复消息或终态后的消息而清空或覆盖。即使 `terminal_body` 已可读，迭代器仍先按序交付排队 chunk，
@@ -310,9 +329,9 @@ protocol_error: ProtocolError | PayloadValidationError | None
 ```
 
 `reason="rpc"` 表示 GetStatus 或 Subscribe 建立、读取、重连最终失败，`last_status` 保存可用的最后一个 gRPC status；
-`reason="protocol"` 表示订阅收到的消息无法解析，或者本实例发布的 request 在订阅中出现了与冻结内容或发布 RPC
-返回 seq 矛盾的消息；此时 `protocol_error` 保留具体错误的类型、消息和公开诊断字段，`last_status` 为 `None`。能够解析、但只破坏某个目标调用
-的 result 形态或 append 链的消息只让该调用得到 `ProtocolError`，不让整个 Subscribe 失败。
+`reason="protocol"` 表示订阅收到的消息无法解析；此时 `protocol_error` 保留具体错误的类型、消息和公开诊断字段，
+`last_status` 为 `None`。能够解析、但只破坏某个目标调用的 result 形态或 append 链的消息只让该调用得到
+`ProtocolError`，不让整个 Subscribe 失败。
 
 每次向调用方或回调交付订阅故障时，都新建等价的 `OpenEventSubscriptionError`，保持上述诊断信息一致，
 不共享异常对象或此前的 Python 调用栈；嵌套的 `protocol_error` 也不保留原始调用栈或异常链。
@@ -327,17 +346,16 @@ UUID 分配、Publish 首次调用或重试、UUID 查询或重试，以及新�
 | --- | --- |
 | 尚未发起首次 Publish，UUID 分配成功 | request 返回保存的订阅错误；cancel 只完成本地关闭，不再 Publish。 |
 | 在途 UUID 分配失败 | 原始 `ResultPublishError(NOT_COMMITTED)`，`event_uuid=None`，不再重试。 |
-| 在途 Publish 或 UUID 查询成功返回合法 seq | 保留发布成功及该 seq，不恢复订阅或发起其他请求。 |
-| Publish 返回 `ALREADY_EXISTS`，尚未开始查询 | `ResultPublishError(COMMITTED)`，`committed_seq=None`，不再查询。 |
+| 在途 Publish 或 UUID 查询成功返回 seq | 保留发布成功及该 seq，不恢复订阅或发起其他请求。 |
+| Publish 返回 `ALREADY_EXISTS`，尚未开始查询 | `ResultPublishError(COMMITTED)`，不再查询。 |
 | 在途 Publish 返回失败，或失败后的重试等待被停止 | 按可靠发布契约已有证据返回 `NOT_COMMITTED` 或 `UNKNOWN`，不再重试。 |
-| 已确认 `ALREADY_EXISTS` 后的查询失败，或查询重试被停止 | `ResultPublishError(COMMITTED)`，`committed_seq=None`。 |
+| 已确认 `ALREADY_EXISTS` 后的查询失败，或查询重试被停止 | `ResultPublishError(COMMITTED)`。 |
 
 本节只约束这个 OpenAI-like 实例自己发起的请求；独立协议 SDK 客户端和 Worker 仍按各自的发布契约执行。
 
 共享订阅最终失败后停止接收新消息。已经接收的输出先交付；已有终态的调用按该终态结束，尚无终态的调用在已有输出
 交付完后得到保存的 `OpenEventSubscriptionError`。request 仍在发布时，先按第 3.2 节确定发布结论；发布成功才采用
-这些接收结果，发布失败仍返回原始发布错误。若错误表明该调用的 request 与冻结内容或发布返回 seq 矛盾，则该调用已暂存
-的结果不能交付，发布成功后仍以此订阅错误结束。
+这些接收结果，发布失败仍返回原始发布错误。
 
 首次 `GetStatus` 最终失败时尚未发布 request，直接返回 `OpenEventSubscriptionError`。
 

@@ -8,13 +8,14 @@ from contextlib import closing
 from dataclasses import dataclass, field
 import http.client
 import io
-import math
 import socket
 import ssl
 import threading
 import time
 from urllib.parse import quote, urlsplit
 import zlib
+
+import msgspec
 
 from openevent.model_proxy_sdk import _json as json
 
@@ -35,23 +36,13 @@ class ProviderEvent:
     status_code: int
     headers: list[dict[str, str]] = field(default_factory=list)
     body: object = None
-    has_body: bool = False
 
 
 def _json(data):
-    def invalid_constant(value):
-        raise ValueError(f"invalid JSON constant {value}")
-
-    def finite_float(value):
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError("Provider JSON number is out of range")
-        return number
-
     try:
-        return json.loads(data.decode("utf-8"), parse_constant=invalid_constant, parse_float=finite_float)
-    except (UnicodeError, ValueError, RecursionError) as exc:
-        raise ProviderError(60007, "Provider response is not valid UTF-8 JSON") from exc
+        return json.raw_body(data)
+    except (msgspec.DecodeError, UnicodeError, RecursionError) as exc:
+        raise ProviderError(60007, "Provider response is not a valid UTF-8 JSON object") from exc
 
 
 class _SocketReader(io.RawIOBase):
@@ -100,11 +91,12 @@ class _HTTPTransport:
 
 
 class ProviderCall:
-    def __init__(self, config, request_body, path, max_payload_bytes):
+    def __init__(self, config, request_body, path, max_payload_bytes, *, streaming):
         self.config = config
         self.request_body = request_body
         self.path = path
         self.limit = max_payload_bytes
+        self.streaming = streaming
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
         self._socket = None
@@ -303,11 +295,11 @@ class ProviderCall:
                 parsed = _json(value.encode("utf-8"))
                 self._deadline = time.monotonic() + self.config.timeout.idle_ms / 1000
                 if self.path == "/v1/responses":
-                    kind = parsed["type"]
+                    kind = json.event_type(parsed)
                     if kind in {"response.completed", "response.failed", "response.incomplete"}:
-                        yield ProviderEvent("completed" if kind == "response.completed" else "failed", status, body=parsed, has_body=True)
+                        yield ProviderEvent("completed" if kind == "response.completed" else "failed", status, body=parsed)
                         return
-                yield ProviderEvent("append", status, body=parsed, has_body=True)
+                yield ProviderEvent("append", status, body=parsed)
         raise ProviderError(60007, "Provider SSE ended without a terminal event")
 
     def __iter__(self):
@@ -318,8 +310,7 @@ class ProviderCall:
         try:
             url = urlsplit(self.config.base_url.rstrip("/") + self.path)
             self._connect(url)
-            streaming = self.request_body.get("stream", False)
-            body = json.dumps(self.request_body, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            body = bytes(self.request_body)
             port = url.port or (443 if url.scheme == "https" else 80)
             target = quote(url.path, safe="/%:@!$&'()*+,;=-._~") or "/"
             with closing(http.client.HTTPConnection(url.hostname, port)) as connection:
@@ -349,8 +340,8 @@ class ProviderCall:
                     headers = [{"name": k.lower(), "value": v} for k, v in response.getheaders()
                                if k.lower() in {"content-type", "retry-after", "x-request-id"}
                                or k.lower().startswith("x-ratelimit-")]
-                    if not streaming:
-                        yield ProviderEvent("result", status, headers, self._json_body(response), True)
+                    if not self.streaming:
+                        yield ProviderEvent("result", status, headers, self._json_body(response))
                         return
                     pause = time.monotonic()
                     yield ProviderEvent("headers", status, headers)
@@ -362,7 +353,7 @@ class ProviderCall:
                             yield event
                             self._deadline += time.monotonic() - pause
                     else:
-                        yield ProviderEvent("completed", status, body=self._json_body(response), has_body=True)
+                        yield ProviderEvent("completed", status, body=self._json_body(response))
         except (http.client.IncompleteRead, http.client.RemoteDisconnected) as exc:
             self._check()
             raise ProviderError(60003, "Provider response ended prematurely") from exc

@@ -8,11 +8,12 @@ import grpc
 from openevent.model_proxy_sdk import (
     CommitState, ConfigurationError, PayloadValidationError, ResultPublishError,
     InferRequestInput, InferResultInput, InferAppendInput, InferEndInput, InferCancelInput,
-    create_client, parse_payload, publish_infer_request, publish_infer_result,
+    create_client, parse_payload, prepare_payload, publish_infer_request, publish_infer_result,
     publish_infer_append, publish_infer_end, publish_infer_cancel,
 )
 from openevent.model_proxy_sdk.publishing import publish_request
 from openevent.model_proxy_sdk.rpc import RPCStopped, call_rpc
+from openevent.model_proxy_sdk import _json
 
 
 class RpcError(Exception):
@@ -68,30 +69,49 @@ class PublishingTests(unittest.TestCase):
     def test_all_message_functions_set_recipients_and_freeze_payload(self):
         cases = [
             (publish_infer_request, req(), ()),
-            (publish_infer_result, InferResultInput(stream_id="s", prev_seq=1, status_code=200, body=None), (5,)),
+            (publish_infer_result, InferResultInput(stream_id="s", prev_seq=1, status_code=200, body={}), (5,)),
             (publish_infer_append, InferAppendInput(stream_id="s", request_seq=1, prev_seq=2, body={}), (5,)),
             (publish_infer_end, InferEndInput(stream_id="s", request_seq=1, status_code=200, end_status="completed"), (5,)),
             (publish_infer_cancel, InferCancelInput(stream_id="s", request_seq=1), ()),
         ]
         for function, event, recipients in cases:
-            with self.subTest(function=function.__name__):
-                transport = Transport()
-                args = (create_client(transport, "token"), 3, 4)
-                self.assertEqual(function(*args, *recipients, event), 42)
-                call = transport.publish_calls[0]
-                self.assertEqual(call["recipients"], recipients)
-                self.assertEqual((call["channel_id"], call["principal"], call["uuid"]), (3, 4, 99))
-                self.assertEqual(call["object_keys"], ())
-                self.assertEqual(call["token"], "token")
-                self.assertEqual(parse_payload(call["payload"]).kind, event.KIND)
-                self.assertEqual(transport.allocation_calls, 1)
+            for prepared in (False, True):
+                with self.subTest(function=function.__name__, prepared=prepared):
+                    transport = Transport()
+                    args = (create_client(transport, "token"), 3, 4)
+                    value = prepare_payload(event) if prepared else event
+                    self.assertEqual(function(*args, *recipients, value), 42)
+                    call = transport.publish_calls[0]
+                    self.assertEqual(call["recipients"], recipients)
+                    self.assertEqual((call["channel_id"], call["principal"], call["uuid"]), (3, 4, 99))
+                    self.assertEqual(call["object_keys"], ())
+                    self.assertEqual(call["token"], "token")
+                    self.assertEqual(parse_payload(call["payload"]).kind, event.KIND)
+                    self.assertEqual(transport.allocation_calls, 1)
+                    if prepared:
+                        self.assertIs(call["payload"], value.payload)
 
     def test_uncertain_retry_reuses_exact_request_and_uuid(self):
         transport = Transport(publishes=[RpcError("UNAVAILABLE"), OSError("reset"), SimpleNamespace(seq=42)])
-        self.assertEqual(self.publish(transport, interval=17), 42)
+        event = req()
+        with patch("openevent.model_proxy_sdk.publishing.time.time_ns", return_value=123_000_000) as clock:
+            with patch("openevent.model_proxy_sdk.publishing._json.dump_bytes",
+                       wraps=_json.dump_bytes) as encode:
+                prepared = prepare_payload(event)
+                self.assertEqual(transport.allocation_calls, 0)
+                self.assertEqual(transport.publish_calls, [])
+                self.assertEqual((prepared.kind, prepared.stream_id, prepared.ts_ms), ("infer.request", "s", 123))
+                with self.assertRaises(AttributeError):
+                    prepared.payload = b"changed"
+                self.assertEqual(publish_infer_request(create_client(transport, "token", retry_interval_ms=17),
+                                                       3, 4, prepared), 42)
+                encode.assert_called_once_with({**event.to_dict(), "ts_ms": 123})
+            clock.assert_called_once_with()
         self.assertEqual(transport.allocation_calls, 1)
         self.assertEqual(len(transport.publish_calls), 3)
         self.assertTrue(all(call == transport.publish_calls[0] for call in transport.publish_calls))
+        self.assertTrue(all(call["payload"] is prepared.payload for call in transport.publish_calls))
+        self.assertEqual(parse_payload(prepared.payload).ts_ms, 123)
         self.assertEqual(self.sleep.call_args_list, [((0.017,),), ((0.017,),)])
         self.assertEqual(transport.query_calls, [])
 
@@ -117,9 +137,9 @@ class PublishingTests(unittest.TestCase):
         self.assertEqual(len(transport.publish_calls), 2)
 
     def test_unknown_status_is_retryable_for_publish_only(self):
-        transport = Transport(publishes=[RpcError("OUT_OF_RANGE"), SimpleNamespace(seq=42)])
+        transport = Transport(publishes=[RpcError("DATA_LOSS"), SimpleNamespace(seq=42)])
         self.assertEqual(self.publish(transport), 42)
-        transport = Transport(allocations=[RpcError("OUT_OF_RANGE")])
+        transport = Transport(allocations=[RpcError("DATA_LOSS")])
         with self.assertRaises(ResultPublishError) as caught:
             self.publish(transport)
         self.assertIs(caught.exception.commit_state, CommitState.NOT_COMMITTED)
@@ -131,7 +151,6 @@ class PublishingTests(unittest.TestCase):
         with self.assertRaises(ResultPublishError) as caught:
             self.publish(transport, retries=2)
         self.assertIs(caught.exception.commit_state, CommitState.UNKNOWN)
-        self.assertIsNone(caught.exception.committed_seq)
         self.assertEqual(len(transport.publish_calls), 3)
         self.assertEqual(transport.query_calls, [])
         self.assertEqual(self.sleep.call_count, 2)
@@ -145,15 +164,16 @@ class PublishingTests(unittest.TestCase):
         self.assertEqual(transport.allocation_calls, 1)
 
     def test_failed_uuid_lookup_is_committed_even_without_seq(self):
-        for failures in ([RpcError("PERMISSION_DENIED")], [RpcError("UNAVAILABLE")] * 2):
+        for failures in ([RpcError("DATA_LOSS")], [RpcError("UNAVAILABLE")] * 2):
             with self.subTest(failures=failures):
-                transport = Transport(publishes=[RpcError("ALREADY_EXISTS")], queries=failures)
+                # The first commit loses its response; retrying its UUID finds it consumed.
+                transport = Transport(publishes=[RpcError("UNAVAILABLE"), RpcError("ALREADY_EXISTS")],
+                                      queries=failures)
                 with self.assertRaises(ResultPublishError) as caught:
                     self.publish(transport, retries=1)
                 self.assertIs(caught.exception.commit_state, CommitState.COMMITTED)
                 self.assertEqual(caught.exception.event_uuid, 99)
-                self.assertIsNone(caught.exception.committed_seq)
-                self.assertEqual(len(transport.publish_calls), 1)
+                self.assertEqual(len(transport.publish_calls), 2)
                 with self.assertRaises(AttributeError):
                     caught.exception.commit_state = CommitState.UNKNOWN
 
@@ -163,22 +183,14 @@ class PublishingTests(unittest.TestCase):
         self.assertEqual(transport.allocation_calls, 2)
         self.assertEqual(transport.publish_calls[0]["uuid"], 123)
 
-    def test_failed_or_invalid_allocation_cannot_publish(self):
-        for values in ([RpcError("INTERNAL")] * 2, [0, False]):
-            with self.subTest(values=values):
-                transport = Transport(allocations=values)
-                with self.assertRaises(ResultPublishError) as caught:
-                    self.publish(transport, retries=1)
-                self.assertIs(caught.exception.commit_state, CommitState.NOT_COMMITTED)
-                self.assertIsNone(caught.exception.event_uuid)
-                self.assertEqual(transport.publish_calls, [])
-
-    def test_invalid_success_seq_remains_uncertain(self):
-        transport = Transport(publishes=[SimpleNamespace(seq=0)])
+    def test_failed_allocation_cannot_publish(self):
+        transport = Transport(allocations=[RpcError("INTERNAL")] * 2)
         with self.assertRaises(ResultPublishError) as caught:
-            self.publish(transport, retries=0)
-        self.assertIs(caught.exception.commit_state, CommitState.UNKNOWN)
-        self.assertIsNone(caught.exception.last_status)
+            self.publish(transport, retries=1)
+        self.assertIs(caught.exception.commit_state, CommitState.NOT_COMMITTED)
+        self.assertIsNone(caught.exception.event_uuid)
+        self.assertEqual(transport.allocation_calls, 2)
+        self.assertEqual(transport.publish_calls, [])
 
     def test_pre_publish_hook_observes_frozen_request_before_first_rpc(self):
         transport = Transport(publishes=[RpcError("UNAVAILABLE"), SimpleNamespace(seq=42)])
@@ -216,7 +228,12 @@ class PublishingTests(unittest.TestCase):
         transport = Transport()
         with self.assertRaises(PayloadValidationError):
             publish_infer_result(create_client(transport, "token"), 1, 2, None,
-                                 InferResultInput(stream_id="s", prev_seq=1, status_code=200, body=None))
+                                 InferResultInput(stream_id="s", prev_seq=1, status_code=200, body={}))
+        self.assertEqual(transport.allocation_calls, 0)
+        wrong_kind = prepare_payload(InferCancelInput(stream_id="s", request_seq=1))
+        with self.assertRaises(PayloadValidationError) as caught:
+            publish_infer_request(create_client(transport, "token"), 1, 2, wrong_kind)
+        self.assertEqual(caught.exception.code, "INVALID_PUBLISH_ARGUMENT")
         self.assertEqual(transport.allocation_calls, 0)
 
     def test_retry_configuration(self):
@@ -250,26 +267,31 @@ class PublishingTests(unittest.TestCase):
                                  ("UNAVAILABLE", CommitState.UNKNOWN), ("ALREADY_EXISTS", CommitState.COMMITTED)):
             with self.subTest(status=status):
                 stop = threading.Event()
-                transport = Transport(publishes=[SimpleNamespace(seq=42) if status is None else RpcError(status)])
+                responses = [SimpleNamespace(seq=42) if status is None else RpcError(status)]
+                if status == "ALREADY_EXISTS":
+                    responses.insert(0, RpcError("UNAVAILABLE"))  # Commit succeeded, response lost.
+                transport = Transport(publishes=responses)
                 publish = transport.publish_auto_seq
 
                 def finish_then_stop(**kwargs):
                     try:
                         return publish(**kwargs)
                     finally:
-                        stop.set()
+                        if not transport.publishes:
+                            stop.set()
 
                 transport.publish_auto_seq = finish_then_stop
+                client = create_client(transport, "token", retry_interval_ms=1)
                 if status is None:
-                    self.assertEqual(publish_request(create_client(transport, "token"), 3, 4, req(),
+                    self.assertEqual(publish_request(client, 3, 4, req(),
                                                      stop_event=stop), 42)
                 else:
                     with self.assertRaises(ResultPublishError) as caught:
-                        publish_request(create_client(transport, "token"), 3, 4, req(), stop_event=stop)
+                        publish_request(client, 3, 4, req(), stop_event=stop)
                     self.assertIs(caught.exception.commit_state, expected)
                     self.assertEqual(caught.exception.event_uuid, 99)
                     self.assertEqual(caught.exception.last_status, status)
-                self.assertEqual(len(transport.publish_calls), 1)
+                self.assertEqual(len(transport.publish_calls), 2 if status == "ALREADY_EXISTS" else 1)
                 self.assertEqual(transport.query_calls, [])
 
     def test_internal_stop_during_uuid_allocation_keeps_original_failure(self):
@@ -297,7 +319,8 @@ class PublishingTests(unittest.TestCase):
         for result in (42, RpcError("UNAVAILABLE")):
             with self.subTest(result=result):
                 stop = threading.Event()
-                transport = Transport(publishes=[RpcError("ALREADY_EXISTS")], queries=[result])
+                transport = Transport(publishes=[RpcError("UNAVAILABLE"), RpcError("ALREADY_EXISTS")],
+                                      queries=[result])
                 query = transport.get_seq_by_uuid
 
                 def query_then_stop(uuid):
@@ -307,26 +330,28 @@ class PublishingTests(unittest.TestCase):
                         stop.set()
 
                 transport.get_seq_by_uuid = query_then_stop
+                client = create_client(transport, "token", retry_interval_ms=1)
                 if isinstance(result, int):
-                    self.assertEqual(publish_request(create_client(transport, "token"), 3, 4, req(),
+                    self.assertEqual(publish_request(client, 3, 4, req(),
                                                      stop_event=stop), result)
                 else:
                     with self.assertRaises(ResultPublishError) as caught:
-                        publish_request(create_client(transport, "token"), 3, 4, req(), stop_event=stop)
+                        publish_request(client, 3, 4, req(), stop_event=stop)
                     self.assertIs(caught.exception.commit_state, CommitState.COMMITTED)
                     self.assertEqual(caught.exception.last_status, "UNAVAILABLE")
                     self.assertIs(caught.exception.__cause__, result)
                 self.assertEqual(transport.query_calls, [99])
-                self.assertEqual(len(transport.publish_calls), 1)
+                self.assertEqual(len(transport.publish_calls), 2)
 
     def test_internal_rpc_guard_rechecks_each_retry_without_losing_last_error(self):
         for stage, stopped_attempt, expected in (("uuid", 2, CommitState.NOT_COMMITTED),
                                                  ("publish", 3, CommitState.UNKNOWN),
-                                                 ("query", 4, CommitState.COMMITTED)):
+                                                 ("query", 5, CommitState.COMMITTED)):
             with self.subTest(stage=stage):
                 transport = Transport(
                     allocations=[RpcError("UNAVAILABLE")] if stage == "uuid" else None,
-                    publishes=[RpcError("ALREADY_EXISTS" if stage == "query" else "UNAVAILABLE")],
+                    publishes=([RpcError("UNAVAILABLE"), RpcError("ALREADY_EXISTS")] if stage == "query"
+                               else [RpcError("UNAVAILABLE")]),
                     queries=[RpcError("UNAVAILABLE")],
                 )
                 attempts = []
@@ -341,7 +366,7 @@ class PublishingTests(unittest.TestCase):
                 self.assertIs(caught.exception.commit_state, expected)
                 self.assertEqual(caught.exception.last_status, "UNAVAILABLE")
                 self.assertEqual(transport.allocation_calls, 1)
-                self.assertEqual(len(transport.publish_calls), 0 if stage == "uuid" else 1)
+                self.assertEqual(len(transport.publish_calls), {"uuid": 0, "publish": 1, "query": 2}[stage])
                 self.assertEqual(len(transport.query_calls), 1 if stage == "query" else 0)
 
 

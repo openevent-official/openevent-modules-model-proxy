@@ -8,8 +8,8 @@
 只保存不透明 payload，分配全局 `seq` 和消息 `uuid`，执行 Channel ACL，并提供
 Fetch/Subscribe；它不解析本协议。
 
-协议假定调用方使用 SDK，并遵守 principal、recipients、stream_id 和单 writer
-约束。不额外提供业务授权，不保证同一个 request 只调用 provider 一次，也不提供业务重试语义。
+发布方和结果消费者必须遵守本协议以及 principal、recipients、stream_id 和单 writer
+约束。本协议不额外提供业务授权，不保证同一个 request 只调用 provider 一次，也不提供业务重试语义。
 
 ## 2. Channel 与 OpenEvent 字段
 
@@ -17,11 +17,10 @@ Fetch/Subscribe；它不解析本协议。
 visibility。description 是如下形状的 JSON 字符串：
 
 ```json
-{"version":"v1","updated_at_ms":1710000000000,"metadata":{}}
+{"metadata":{}}
 ```
 
-description 解码后必须是 JSON object，并且只能包含 `version`、`updated_at_ms`、`metadata`
-三个必填字段。`version` 必须是字符串 `"v1"`；`updated_at_ms` 必须是非负整数，`bool` 不算整数；
+description 解码后必须是 JSON object，并且只能包含必填字段 `metadata`。
 `metadata` 必须是 JSON object，内部内容由应用决定。
 
 一个 Channel 是一个 Model Proxy 会话域，由部署配置绑定到且只能绑定到一个运行中的 Worker。
@@ -34,7 +33,8 @@ OpenEvent 顶层字段保持原生语义：
 - `seq` 是不可变全局位置，也是 `prev_seq` 引用的值。
 - `recipients` 只是投递过滤字段，不是 ACL 或保密边界。
 - `uuid` 是服务端分配的消息 ID，既不是 `stream_id`，也不是 `request_seq`。PublishAutoSeq
-  结果不确定时必须复用同一 UUID，具体按[单条事件可靠发布契约](RESULT_PUBLISHING_cn.md)处理。
+  结果不确定时，重试必须复用同一 UUID 和冻结的消息内容；提交与 UUID 查询语义以
+  [OpenEvent API 契约](../openevent-sdk/docs/API_cn.md)为准。
 
 ## 3. JSON 与消息字段
 
@@ -45,7 +45,7 @@ OpenEvent 顶层字段保持原生语义：
 | --- | --- |
 | `kind` | string；只能是 `infer.request`、`infer.result`、`infer.append`、`infer.end` 或 `infer.cancel` |
 | `stream_id` | string；调用方生成的调用标识；长度 `1..128`，每个字符都必须属于 ASCII `[A-Za-z0-9._:-]` |
-| `ts_ms` | integer，`>= 0`，不另设上限；发布方生成并冻结的 Unix 毫秒时间戳 |
+| `ts_ms` | integer，`>= 0`；发布方生成并冻结的 Unix 毫秒时间戳 |
 | `provider` | string；非空；字段合法性不取决于 Worker 当前是否配置了该名称 |
 | `method` | string；只能是 `POST` |
 | `path` | string；只能是 `/v1/chat/completions` 或 `/v1/responses` |
@@ -54,14 +54,14 @@ OpenEvent 顶层字段保持原生语义：
 | `status_code` | integer；Provider HTTP 状态为 `100..599`，或第 7 节明确列出的 Model Proxy 状态码 |
 | `headers` | 非空 array；每个元素必须是只含 `name`、`value` 的 object，两个值都是 string；`name` 只能是第 5 节允许的小写名称 |
 | `end_status` | string；只能是 `completed`、`failed` 或 `interrupted` |
-| `body` | `infer.request` 中必须是 object；其他消息中的具体 JSON 类型和是否允许省略见下表 |
+| `body` | 存在时必须是 object；内容遵循第 4.1 节的 OpenAI API 契约，或第 7 节的 Model Proxy 错误结构；是否允许省略见下表 |
 
 | `kind` | 必填字段 | 可选字段 | `body` 规则 |
 | --- | --- | --- | --- |
 | `infer.request` | `kind`、`stream_id`、`ts_ms`、`method`、`path`、`body` | `provider`、`prev_seq` | 必须是 object；`stream` 存在时必须是 boolean |
-| `infer.result` | `kind`、`stream_id`、`ts_ms`、`prev_seq`、`status_code` | `headers`、`body` | 允许任意 JSON 值；`body` 缺失与 `body: null` 含义不同 |
-| `infer.append` | `kind`、`stream_id`、`ts_ms`、`request_seq`、`prev_seq`、`body` | 无 | 允许任意 JSON 值 |
-| `infer.end` | `kind`、`stream_id`、`ts_ms`、`request_seq`、`status_code`、`end_status` | `body` | `completed` 可以省略；`failed` 和 `interrupted` 必须提供，允许任意 JSON 值 |
+| `infer.result` | `kind`、`stream_id`、`ts_ms`、`prev_seq`、`status_code` | `headers`、`body` | object；普通终态包含 body，流式链头省略 body |
+| `infer.append` | `kind`、`stream_id`、`ts_ms`、`request_seq`、`prev_seq`、`body` | 无 | object；对应 endpoint 的流事件 |
+| `infer.end` | `kind`、`stream_id`、`ts_ms`、`request_seq`、`status_code`、`end_status` | `body` | object；`completed` 可以省略，`failed` 和 `interrupted` 必须提供 |
 | `infer.cancel` | `kind`、`stream_id`、`ts_ms`、`request_seq` | 无 | 不包含 `body` |
 
 严格解析同时检查 payload 是 UTF-8 JSON object、字段集合、JSON 类型和本节列出的取值范围。Worker 无论在启动扫描
@@ -111,16 +111,16 @@ request 声明 `body.stream=true`，先提交的合法 cancel 仍可按第 6 节
 
 `openai_compatible` Provider 必须满足以下规则：
 
-1. Provider 接受 JSON object 形式的 `POST /v1/chat/completions` 和 `POST /v1/responses` 请求；Model Proxy
-   原样转发 request 的 `body`，不会替 Provider 校验模型名、消息内容或其他业务字段。
+1. `POST /v1/chat/completions` 和 `POST /v1/responses` 的请求、响应及流事件遵循对应 OpenAI API 的字段和取值约定。
+   Model Proxy 只读取本协议需要的字段，不重复实现完整 OpenAI schema 校验；模型名、消息内容和其他请求字段由 Provider 校验。
 2. `body.stream` 缺失或为 `false` 时，Provider 返回一个完整 HTTP 响应。响应 body 必须是 UTF-8 编码的完整
-   JSON 值，HTTP 成功和 HTTP 错误响应都遵守这条规则。
+   JSON object，HTTP 成功和 HTTP 错误响应都遵守这条规则。
 3. `body.stream=true` 时，Provider 可以返回 `Content-Type` 媒体类型为 `text/event-stream` 的 UTF-8 SSE；
    Chat Completions 用 `[DONE]` 正常结束，Responses 用 `response.completed`、`response.failed` 或 `response.incomplete`
    结束。Responses 的 SSE 数据事件必须是含字符串 `type` 的 JSON object，`type` 使用
    [OpenAI 官方事件定义](https://developers.openai.com/api/reference/resources/responses/streaming-events)中的事件类型。
    SSE 的具体解析和终态映射见第 6 节。
-4. 流式请求也可以返回非 SSE 的完整 JSON 响应；Model Proxy 按第 6 节把它记为流式终态。
+4. 流式请求也可以返回非 SSE 的完整 JSON object 响应；Model Proxy 按第 6 节把它记为流式终态。
 5. Provider 必须返回合法 HTTP 状态码和可解析的响应头。Model Proxy 只记录第 5 节列出的响应头；其他响应头
    不属于 `llm.v1` 的可观察结果。
 
@@ -172,9 +172,9 @@ result 的 `prev_seq` 等于目标 request 的 `request_seq`。流式无 body re
 
 result 由 Worker principal 发布，且只把 request principal 放入 recipients。具体形态由对应 request 决定：
 
-1. 合法非流式 request 使用第一条匹配的 result 作为终态响应，并且该 result 必须带 `body`。JSON `null` 是
-   一个明确存在的 body，不能当作省略。第一条匹配的 result 如果没有 `body`，任务报告协议错误；消费者不能
-   跳过它再使用后续 result。provider body 不依赖 `Content-Type`，必须能解为一个完整 JSON 值。通过
+1. 合法非流式 request 使用第一条匹配的 result 作为终态响应，并且该 result 必须带 `body`。
+   第一条匹配的 result 如果没有 `body`，任务报告协议错误；消费者不能跳过它再使用后续 result。
+   provider body 不依赖 `Content-Type`，必须是一个完整 JSON object。通过
    Provider 输入大小检查后仍解码失败时，Worker 按 5.1 节的失败映射写出普通终态。
 2. 通过重复、大小和 provider 配置检查并进入 Provider 调用的流式 request，如果发布 result，该 result 必须省略
    `body`。除非 Worker 已经观察到获胜 cancel，否则
@@ -193,14 +193,14 @@ Worker 或消费者状态机根据 request 校验 result 形态。
 
 | Provider 阶段 | `status_code` | `body` 和 headers |
 | --- | --- | --- |
-| 收到 HTTP 响应，状态码为 `100..599` | Provider 原始 HTTP 状态码 | 能解为 JSON 的响应 body 原样保留；按响应头转发规则保留 headers。HTTP 4xx/5xx 仍是普通终态，调用方依据状态码判断失败。 |
+| 收到 HTTP 响应，状态码为 `100..599` | Provider 原始 HTTP 状态码 | 转发符合第 4.1 节的响应 body；按响应头转发规则保留 headers。HTTP 4xx/5xx 仍是普通终态，调用方依据状态码判断失败。 |
 | 等待响应头期间超时 | `60000` | 标准 Model Proxy 错误 body；不提供 provider 响应头。 |
 | 明确 DNS 解析失败 | `60001` | 标准 Model Proxy 错误 body；不提供 provider 响应头。 |
 | 明确 TLS 握手失败 | `60002` | 标准 Model Proxy 错误 body；不提供 provider 响应头。 |
 | 明确连接失败或连接重置，且尚未得到响应头 | `60003` | 标准 Model Proxy 错误 body；不提供 provider 响应头。 |
 | 已收到响应头，读取 body 时无进展超时 | `60000` | 丢弃未完成的 body 和 headers，写标准 Model Proxy 错误 body。 |
 | 已收到响应头，读取 body 时连接重置或提前结束 | `60003` | 丢弃未完成的 body 和 headers，写标准 Model Proxy 错误 body。 |
-| 已收到响应，但 body 不是完整 JSON，或 UTF-8/解析失败 | `60007` | 丢弃原始 body 和 headers，写标准 Model Proxy 错误 body。 |
+| 已收到响应，但 body 不是完整 JSON object，或 UTF-8/解析失败 | `60007` | 丢弃原始 body 和 headers，写标准 Model Proxy 错误 body。 |
 | 输出 payload 超过 `max_payload_bytes` | `60008` | 丢弃过大的 provider body 和 headers，写可放入上限的小型标准错误 body。 |
 
 标准 Model Proxy 错误 body 的 `error.code` 与状态码对应关系见第 7 节。普通调用的 provider 请求不因这些失败自动重试；
@@ -241,14 +241,14 @@ HTTP 响应打开并发送事件；事件由字段行组成，空行表示事件
 append body；协议不解释 `choices`、`delta`、usage 或 Provider 分段边界。第 4.1 节列出的 Provider 终态
 标记不创建 append：Chat Completions 的 `[DONE]` 不写入 body；Responses 的终态事件原样放入 end 的 `body`。
 
-如果流式 request 收到普通 HTTP 响应而不是 `text/event-stream`，Worker 不依赖 `Content-Type`，先把完整 body
-按 JSON 解码。解码成功时，该响应就是 provider 终态，直接写一条包含该 JSON body 的 completed `infer.end`，
+如果流式 request 收到普通 HTTP 响应而不是 `text/event-stream`，Worker 不依赖 `Content-Type`，先检查完整 body
+是 JSON object。检查通过时，该响应就是 provider 终态，直接写一条包含该 body 的 completed `infer.end`，
 不创建 append。HTTP 状态码同时写入无 body result 和 completed end；非 2xx 仍由消费者作为 provider HTTP 错误处理。
 
-本项目对 Chat Completions 和 Responses 的最小兼容契约规定，响应（包括错误响应）必须是 JSON。非事件流 body 无法解为 JSON
+本项目对 Chat Completions 和 Responses 的最小兼容契约规定，响应（包括错误响应）必须是 JSON object。非事件流 body 无法解为 JSON object
 就是 Provider 响应解析失败，不是兼容响应：Worker 丢弃原始 body，写一条带标准错误 body 的 `60007 interrupted`
 end。此前已写无 body result 时，该 result 保留已观察到的 HTTP 状态和 headers，而 end 使用 `60007`；此前还没写
-result 时，直接写 end。事件流的每个非终态事件同样必须是合法 JSON；事件 JSON 解析失败也按同样的
+result 时，直接写 end。事件流的每个非终态事件同样必须是合法 JSON object；事件 JSON 解析失败也按同样的
 `60007 interrupted` end 处理。两种路径都不把原始 body 交给调用方。
 
 ### 6.2 infer.end

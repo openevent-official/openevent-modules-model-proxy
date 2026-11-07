@@ -2,8 +2,8 @@
 
 [中文版](SDK_USAGE_cn.md)
 
-See the [README](../README.md#build-and-test) for installation and [SDK_API.md](SDK_API.md)
-for the complete API.
+See the [README](../README.md#build-and-test) for installation; `make install` satisfies the runtime
+dependencies declared by the package. See [SDK_API.md](SDK_API.md) for the complete API.
 
 ## 1. OpenAI-like Client
 

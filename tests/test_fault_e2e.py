@@ -17,6 +17,7 @@ from openevent.model_proxy_sdk import (
 )
 
 import test_e2e as support
+from openai_fixtures import responses_request, response_start_events, response_end_events
 
 
 class LostResponse(grpc.RpcError):
@@ -242,7 +243,8 @@ class FaultEndToEndTests(unittest.TestCase):
         protocol = create_client(transport, self.caller_token, max_retries=1, retry_interval_ms=10)
         _, results = background(lambda: publish_infer_request(
             protocol, self.channel, self.caller,
-            InferRequestInput(stream_id="lost-reply", method="POST", path="/v1/responses", body={}),
+            InferRequestInput(stream_id="lost-reply", method="POST", path="/v1/responses",
+                              body=responses_request()),
         ))
         seq = result_within(results)
         self.assertEqual(seq, transport.committed_seq)
@@ -263,7 +265,8 @@ class FaultEndToEndTests(unittest.TestCase):
         self.addCleanup(delayed.release.set)
         with patch("openevent.model_proxy_sdk.openai.OpenEventClient", return_value=delayed):
             client = self.openai()
-        _, results = background(lambda: client.responses.create(stream=True, stream_id="before-subscribe"))
+        _, results = background(lambda: client.responses.create(
+            **responses_request(stream=True, stream_id="before-subscribe")))
         try:
             self.assertTrue(delayed.attempted.wait(2))
             stream = result_within(results, timeout=2)
@@ -273,14 +276,16 @@ class FaultEndToEndTests(unittest.TestCase):
             self.assertIsNone(stream.result_openevent_seq)
             messages = support.eventually(lambda: self.messages() if
                 any(m.payload.kind == "infer.end" for m in self.messages()) else None, timeout=3)
+            expected_chunks = response_start_events() + response_end_events()[:-1]
             self.assertEqual([m.payload.kind for m in messages],
-                             ["infer.request", "infer.result", "infer.append", "infer.append", "infer.end"])
+                             ["infer.request", "infer.result"] +
+                             ["infer.append"] * len(expected_chunks) + ["infer.end"])
             self.assertEqual(messages[0].seq, stream.request_seq)
             self.assertFalse(delayed.connected.is_set())
         finally:
             delayed.release.set()
-        _, chunks = background(lambda: [part.body["delta"] for part in stream])
-        self.assertEqual(result_within(chunks), ["hello", "world"])
+        _, chunks = background(lambda: [part.body for part in stream])
+        self.assertEqual(result_within(chunks), expected_chunks)
         self.assertTrue(delayed.connected.is_set())
         self.assertEqual(len(delayed.anchors), 1)
         self.assertLess(delayed.anchors[0], stream.request_seq)
@@ -299,11 +304,15 @@ class FaultEndToEndTests(unittest.TestCase):
 
         with patch("openevent.model_proxy_sdk.openai.OpenEventClient", return_value=transport):
             client = self.openai(on_subscription_error=on_error)
-        completed = client.responses.create(stream=True, stream_id="completed-before-failure")
+        completed = client.responses.create(
+            **responses_request(stream=True, stream_id="completed-before-failure"))
         support.eventually(lambda: completed.terminal_has_body is True, timeout=3)
-        held = client.responses.create(stream=True, stream_id="held-before-failure", test_mode="hold")
-        self.assertTrue(transport.wait_for_appends(held.stream_id, 2))
-        waiting = client.responses.create(stream=True, stream_id="waiting-before-failure")
+        held = client.responses.create(**responses_request(
+            stream=True, stream_id="held-before-failure", metadata={"test_mode": "hold"}))
+        expected_held = response_start_events()
+        self.assertTrue(transport.wait_for_appends(held.stream_id, len(expected_held)))
+        waiting = client.responses.create(
+            **responses_request(stream=True, stream_id="waiting-before-failure"))
         self.assertIsNone(waiting.result_openevent_seq)
         self.assertIsNone(held.terminal_has_body)
         held_metadata = (held.result_openevent_seq, held.response_status_code, held.response_headers)
@@ -321,7 +330,8 @@ class FaultEndToEndTests(unittest.TestCase):
             "get_status": 1, "subscribe": 2,
         })
         with self.assertRaises(OpenEventSubscriptionError) as caught:
-            client.responses.create(stream=True, stream_id="rejected-after-failure")
+            client.responses.create(
+                **responses_request(stream=True, stream_id="rejected-after-failure"))
         self.assertSubscriptionError(caught.exception, error)
 
         _, closed_stream = background(held.close)
@@ -334,9 +344,10 @@ class FaultEndToEndTests(unittest.TestCase):
         client.close()
         self.assertEqual(transport.snapshot(), before_close)
 
-        self.assertEqual([chunk.body["delta"] for chunk in completed], ["hello", "world"])
+        self.assertEqual([chunk.body for chunk in completed],
+                         response_start_events() + response_end_events()[:-1])
         self.assertEqual(completed.terminal_body, completed_body)
-        self.assertEqual([next(held).body["delta"] for _ in range(2)], ["hello", "world"])
+        self.assertEqual([next(held).body for _ in expected_held], expected_held)
         for stream in (held, waiting):
             with self.assertRaises(OpenEventSubscriptionError) as caught:
                 next(stream)
@@ -370,11 +381,15 @@ class FaultEndToEndTests(unittest.TestCase):
 
         with patch("openevent.model_proxy_sdk.openai.OpenEventClient", return_value=transport):
             client = self.openai(on_subscription_error=on_error)
-        completed = client.responses.create(stream=True, stream_id="completed-before-close")
+        completed = client.responses.create(
+            **responses_request(stream=True, stream_id="completed-before-close"))
         self.assertTrue(transport.wait_for_messages("infer.end", completed.stream_id))
-        held = client.responses.create(stream=True, stream_id="held-before-close", test_mode="hold")
-        self.assertTrue(transport.wait_for_appends(held.stream_id, 2))
-        waiting = client.responses.create(stream=True, stream_id="waiting-before-close")
+        held = client.responses.create(**responses_request(
+            stream=True, stream_id="held-before-close", metadata={"test_mode": "hold"}))
+        expected_held = response_start_events()
+        self.assertTrue(transport.wait_for_appends(held.stream_id, len(expected_held)))
+        waiting = client.responses.create(
+            **responses_request(stream=True, stream_id="waiting-before-close"))
         self.assertIsNone(waiting.result_openevent_seq)
         _, waiting_result = background(lambda: next(waiting))
         held_metadata = (held.result_openevent_seq, held.response_status_code, held.response_headers)
@@ -393,9 +408,10 @@ class FaultEndToEndTests(unittest.TestCase):
         with self.assertRaises(OpenEventSubscriptionError) as caught:
             result_within(waiting_result)
         self.assertSubscriptionError(caught.exception, error)
-        self.assertEqual([chunk.body["delta"] for chunk in completed], ["hello", "world"])
+        self.assertEqual([chunk.body for chunk in completed],
+                         response_start_events() + response_end_events()[:-1])
         self.assertEqual(completed.terminal_body, completed_body)
-        self.assertEqual([next(held).body["delta"] for _ in range(2)], ["hello", "world"])
+        self.assertEqual([next(held).body for _ in expected_held], expected_held)
         with self.assertRaises(OpenEventSubscriptionError) as caught:
             next(held)
         self.assertSubscriptionError(caught.exception, error)
@@ -421,7 +437,8 @@ class FaultEndToEndTests(unittest.TestCase):
         with patch("openevent.model_proxy_sdk.openai.OpenEventClient", return_value=transport):
             client = self.openai(on_subscription_error=on_error)
         _, publication = background(
-            lambda: client.responses.create(stream=True, stream_id="reply-after-close"),
+            lambda: client.responses.create(
+                **responses_request(stream=True, stream_id="reply-after-close")),
         )
         self.assertTrue(transport.committed.wait(2))
         self.assertTrue(transport.wait_for_messages("infer.end", "reply-after-close"))
@@ -438,7 +455,8 @@ class FaultEndToEndTests(unittest.TestCase):
         transport.release.set()
         stream = result_within(publication)
         self.assertEqual(stream.request_seq, transport.committed_seq)
-        self.assertEqual([chunk.body["delta"] for chunk in stream], ["hello", "world"])
+        self.assertEqual([chunk.body for chunk in stream],
+                         response_start_events() + response_end_events()[:-1])
         self.assertEqual(stream.terminal_body["type"], "response.completed")
         self.assertNotIn("infer.cancel", [message.payload.kind for message in self.messages()])
 
@@ -474,7 +492,6 @@ class FaultEndToEndTests(unittest.TestCase):
         error = caught.exception.__cause__
         self.assertIsInstance(error, ResultPublishError)
         self.assertIs(error.commit_state, CommitState.COMMITTED)
-        self.assertIsNone(error.committed_seq)
         self.assertEqual(error.last_status, "UNAVAILABLE")
         self.assertEqual(len(transport.publish_calls), 2)
         self.assertEqual(transport.publish_calls[0], transport.publish_calls[1])
@@ -483,5 +500,5 @@ class FaultEndToEndTests(unittest.TestCase):
         messages = self.messages()
         self.assertEqual([m.payload.kind for m in messages], ["infer.request", "infer.result"])
         self.assertEqual(messages[1].payload.prev_seq, request_seq)
-        self.assertEqual(messages[1].payload.body["answer"], "ok")
+        self.assertEqual(messages[1].payload.body["output"][0]["content"][0]["text"], "ok")
         self.assertEqual(messages[1].uuid, error.event_uuid)

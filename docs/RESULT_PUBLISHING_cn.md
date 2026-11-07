@@ -13,18 +13,21 @@ UUID、`PublishAutoSeq` 和 `GetSeqByUuid` 基础语义见
 
 ## 1. 发布前冻结
 
-每条逻辑事件使用一个 UUID。UUID 分配调用（SDK 的 `get_uuid()`）按
-[OpenEvent 普通 RPC 重试规则](OPEN_EVENT_RPC_RETRY_cn.md)执行，只使用成功返回的合法非零 UUID。
-响应丢失后重试可能拿到另一个 UUID；未返回的 UUID 留作空洞，不用于发布，也不回收。取得 UUID 后冻结：
+先按 [SDK 输入模型与发布准备契约](SDK_API_cn.md#22-输入模型)在本地生成并冻结时间戳和完整 payload 字节；
+传入已准备对象时直接采用其冻结内容，不重新编码。这一步不分配 UUID，也不发起 RPC。
 
-- 完整的 UTF-8 payload 字节，包括首次生成的 `kind` 和 `ts_ms`；
+每条逻辑事件使用一个 UUID。开始发布后，UUID 分配调用（SDK 的 `get_uuid()`）按
+[OpenEvent 普通 RPC 重试规则](OPEN_EVENT_RPC_RETRY_cn.md)执行，直接使用成功返回的 UUID。
+响应丢失后重试可能拿到另一个 UUID；未返回的 UUID 留作空洞，不用于发布，也不回收。取得 UUID 后冻结完整发布请求：
+
+- 已在本地准备好的 UTF-8 payload 字节，包括已固定的 `kind` 和 `ts_ms`；
 - Channel、发布 principal 和 recipients；输出事件还包括 request principal；
 - OpenEvent UUID；
 - 交给 `PublishAutoSeq` 的其他请求字段。
 
 后续发布尝试必须复用同一 UUID 和冻结请求。
 UUID 分配最终失败时，不调用 `PublishAutoSeq`，抛出
-`ResultPublishError(commit_state=NOT_COMMITTED, event_uuid=None, committed_seq=None)`；
+`ResultPublishError(commit_state=NOT_COMMITTED, event_uuid=None)`；
 有可用 gRPC 状态时写入 `last_status`。
 
 ## 2. PublishAutoSeq 流程
@@ -36,7 +39,7 @@ UUID 分配最终失败时，不调用 `PublishAutoSeq`，抛出
 
 ### 2.1 返回分类
 
-- `OK` 且响应带合法正整数 seq：事件已经提交，直接返回该 seq。
+- `OK`：事件已经提交，直接返回响应中的 seq。
 - `ALREADY_EXISTS`：本次尝试没有创建新消息，并且该 UUID 已被此前提交的消息消费。停止发布，按第 3 节
   调用 `GetSeqByUuid` 取得原消息 seq。
 - `UNAUTHENTICATED`、`PERMISSION_DENIED`、`NOT_FOUND`、`INVALID_ARGUMENT` 或
@@ -56,8 +59,8 @@ UUID 分配最终失败时，不调用 `PublishAutoSeq`，抛出
 `GetSeqByUuid` 的调用次数、等待和错误分类全部按
 [OpenEvent 普通 RPC 重试规则](OPEN_EVENT_RPC_RETRY_cn.md)执行，并与 `PublishAutoSeq` 分别计算重试次数。
 
-- 查询成功并返回合法正整数 seq：返回该 committed seq，发布成功结束。
-- 查询按普通 RPC 契约最终失败：返回 `commit_state=COMMITTED` 且 `committed_seq=None`。
+- 查询成功：直接返回查询得到的 committed seq，发布成功结束。
+- 查询按普通 RPC 契约最终失败：抛出 `ResultPublishError(commit_state=COMMITTED)`。
 
 进入 UUID 对账后，不得再次调用 `PublishAutoSeq`，也不得换 UUID。
 
@@ -67,16 +70,15 @@ UUID 分配最终失败时，不调用 `PublishAutoSeq`，抛出
 from openevent.model_proxy_sdk import CommitState, ResultPublishError
 ```
 
-异常字段只读：`commit_state` 为 `CommitState` 枚举；`event_uuid` 和 `committed_seq` 为 `int | None`；
+异常字段只读：`commit_state` 为 `CommitState` 枚举；`event_uuid` 为 `int | None`；
 `last_status` 为 `str | None`。
 
 - `commit_state`：
   - `NOT_COMMITTED`：可以证明这条逻辑事件没有发布。典型情况是 UUID 分配失败，或所有发布尝试都得到
     “本次未提交”终态且从未出现不确定尝试。
-  - `COMMITTED`：可以证明事件 UUID 已被提交消息消费，但当前没有取得可返回的合法 seq。
+  - `COMMITTED`：可以证明事件 UUID 已被提交消息消费，但当前没有取得其 seq。
   - `UNKNOWN`：至少一次发布尝试可能已经提交，且当前既没有取得 committed seq，也没有其他已提交证明。
 - `event_uuid`：成功取得并冻结 UUID 后填写；UUID 分配失败时为 `None`。
-- `committed_seq`：已经确认的 committed seq；不知道时为 `None`。取得合法 seq 时，发布 API 通常直接成功返回该 seq。
 - `last_status`：最后观察到的 gRPC 或传输状态，仅用于诊断，不能单独覆盖 `commit_state` 的结论。
 
 只有 `NOT_COMMITTED` 才允许调用方把这条逻辑事件当作未发布。`COMMITTED` 和 `UNKNOWN` 都不能通过更换 UUID

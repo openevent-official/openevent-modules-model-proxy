@@ -18,8 +18,9 @@ OpenEvent channel。
 
 - 协议版本：`llm.v1`
 - Python 版本：`>=3.10`
-- OpenEvent SDK：`openevent-sdk>=0.11.1`
+- OpenEvent SDK：`openevent-sdk>=0.13.0`
 - YAML 解析：`PyYAML>=6.0`
+- JSON 编解码：`msgspec>=0.19.0`
 - Provider 类型：`openai_compatible`，兼容要求见 [llm.v1 协议](docs/LLM_PROTOCOL_cn.md#41-openai_compatible-的最小兼容契约)
 - Endpoint：`POST /v1/chat/completions`、`POST /v1/responses`，均支持普通和流式调用
 - Python API：协议消息构造、解析与发布，以及 OpenAI-like 同步客户端
@@ -47,7 +48,8 @@ make clean    # 清理 dist/ 和 build/
 再替换本项目包，即使版本号相同也会生效；依赖解析失败时不替换本项目。用 `PYTHON` 选择 Python 环境，
 `INSTALL_ARGS` 可传入 `--find-links` 等索引和网络选项，不能改变安装位置或依赖替换策略。
 
-测试使用当前环境已安装的 SDK，不从子模块安装；测试工具 `packaging` 用于版本检查：
+测试前先用 `make install` 安装本项目并补齐运行依赖。测试使用当前环境已安装的 SDK，不从子模块安装；
+测试工具 `packaging` 用于版本检查：
 
 ```bash
 python3 -B -m pip install packaging

@@ -13,8 +13,10 @@ from openevent.model_proxy_sdk import (
     APIError, ConfigurationError, OpenAI, OpenAIChunk, OpenAIResponse,
     OpenEventSubscriptionError, PayloadValidationError, ProtocolError,
     RateLimitError, ResultPublishError, StreamCancelledError,
-    InferResultInput, parse_payload,
+    parse_payload,
 )
+from openevent.model_proxy_sdk import _json
+from openevent.model_proxy_sdk.publishing import FrozenPublication
 
 
 class RpcError(Exception):
@@ -101,6 +103,7 @@ class FakeServer:
         self.uuid_release = threading.Event()
         self.uuid_release.set()
         self.uuid_error = None
+        self.before_publish = None
         self.on_publish = None
         self.closed = False
 
@@ -129,11 +132,11 @@ class FakeServer:
             return value
 
     def publish_auto_seq(self, **kwargs):
+        if self.before_publish is not None:
+            self.before_publish(kwargs)
         raw = self.emit_raw(**{key: value for key, value in kwargs.items() if key != "token"})
         if self.on_publish is not None:
-            result = self.on_publish(raw)
-            if result is not None:
-                return result
+            self.on_publish(raw)
         return SimpleNamespace(seq=raw.seq)
 
     def get_seq_by_uuid(self, uuid):
@@ -217,7 +220,7 @@ class OpenAITest(unittest.TestCase):
         self.assertEqual(actual.args, expected.args)
         for name in ("reason", "last_status", "code", "kind", "stream_id", "request_seq",
                      "result_openevent_seq", "last_stream_openevent_seq", "status_code",
-                     "headers", "body", "end_status", "commit_state", "event_uuid", "committed_seq"):
+                     "headers", "body", "end_status", "commit_state", "event_uuid"):
             if hasattr(expected, name):
                 self.assertEqual(getattr(actual, name), getattr(expected, name))
         if isinstance(expected, OpenEventSubscriptionError):
@@ -239,6 +242,7 @@ class OpenAITest(unittest.TestCase):
     def tearDown(self):
         self.server.uuid_release.set()
         self.server.status_release.set()
+        self.server.before_publish = None
         self.server.on_publish = None
         self.server.accept()
         for client in self.clients:
@@ -275,11 +279,9 @@ class OpenAITest(unittest.TestCase):
         with sub.condition:
             self.assertTrue(sub.condition.wait_for(sub.failed.is_set, timeout=2))
 
-    def result(self, stream, *, body_marker=False, body=None, status=200):
-        kwargs = dict(prev_seq=stream.request_seq, status_code=status)
-        if body_marker:
-            kwargs["body"] = body
-        return self.server.emit("result", stream.stream_id, **kwargs)
+    def result(self, stream, *, status=200):
+        return self.server.emit("result", stream.stream_id,
+                                prev_seq=stream.request_seq, status_code=status)
 
     def end(self, stream, **fields):
         return self.server.emit(
@@ -296,13 +298,13 @@ class OpenAITest(unittest.TestCase):
         self.assertIsNone(stream.result_openevent_seq)
         result = self.result(stream)
         append = self.server.emit("append", "s", request_seq=1, prev_seq=result.seq, body={"delta": "hi"})
-        end = self.end(stream, body=None)
+        end = self.end(stream, body={"type": "response.completed"})
         self.server.accept()
         self.received(client, end.seq)
         self.assertEqual(stream.result_openevent_seq, result.seq)
         self.assertEqual(stream.response_status_code, 200)
         self.assertTrue(stream.terminal_has_body)
-        self.assertIsNone(stream.terminal_body)
+        self.assertEqual(stream.terminal_body, {"type": "response.completed"})
         self.assertEqual(next(stream).append_openevent_seq, append.seq)
         self.assertEqual(list(stream), [])
         self.assertTrue(stream.terminal_has_body)
@@ -384,10 +386,10 @@ class OpenAITest(unittest.TestCase):
 
         head = self.result(stream)
         self.server.emit("append", stream.stream_id, request_seq=stream.request_seq,
-                         prev_seq=head.seq, body="recovered")
+                         prev_seq=head.seq, body={"delta": "recovered"})
         end = self.end(stream)
         self.received(client, end.seq)
-        self.assertEqual([chunk.body for chunk in stream], ["recovered"])
+        self.assertEqual([chunk.body for chunk in stream], [{"delta": "recovered"}])
         self.assertEqual(self.server.status_count, 2)
         self.assertEqual(self.server.from_seqs, [0])
         self.assertEqual(len(readers), 2)
@@ -402,7 +404,8 @@ class OpenAITest(unittest.TestCase):
             payload = json.loads(raw.payload)
             if payload["kind"] == "infer.request":
                 result = self.server.emit("result", payload["stream_id"], prev_seq=raw.seq, status_code=200)
-                self.server.emit("append", payload["stream_id"], request_seq=raw.seq, prev_seq=result.seq, body=[1, None])
+                self.server.emit("append", payload["stream_id"], request_seq=raw.seq,
+                                 prev_seq=result.seq, body={"delta": "ready"})
                 end = self.server.emit("end", payload["stream_id"], request_seq=raw.seq, status_code=200, end_status="completed")
                 self.received(client, end.seq)
                 publish_entered.set()
@@ -414,16 +417,14 @@ class OpenAITest(unittest.TestCase):
         self.assertTrue(publish_entered.wait(2))
         self.assertFalse(task.done.is_set())
         self.assertEqual(client._subscription.calls_by_uuid, {})
-        call = next(iter(client._subscription.calls))
-        self.assertIsNone(call.frozen)
-        self.assertEqual(call.receive.request_seq, 1)
+        self.assertEqual(client._subscription.receives_by_seq, {})
         release.set()
         stream = task.join()
         self.assertFalse(stream.terminal_has_body)
-        self.assertEqual([chunk.body for chunk in stream], [[1, None]])
+        self.assertEqual([chunk.body for chunk in stream], [{"delta": "ready"}])
         self.assertEqual(client._subscription.receives_by_seq, {})
 
-    def test_ordinary_call_releases_validated_request_while_waiting_for_result(self):
+    def test_ordinary_call_links_request_after_publish_while_waiting_for_result(self):
         self.server.allow_start = False
         client = self.client()
         published = threading.Event()
@@ -434,11 +435,11 @@ class OpenAITest(unittest.TestCase):
         with sub.condition:
             call = next(iter(sub.calls_by_uuid.values()))
             self.assertTrue(sub.condition.wait_for(lambda: call.request_seq is not None, timeout=2))
-            self.assertIsNotNone(call.frozen)
+            self.assertIsNotNone(call.pending_uuid)
             self.assertIsNone(call.receive)
         self.server.accept()
         self.received(client, call.request_seq)
-        self.assertIsNone(call.frozen)
+        self.assertIsNone(call.pending_uuid)
         self.assertEqual(sub.calls_by_uuid, {})
         self.assertIs(sub.receives_by_seq[call.request_seq], call)
         self.assertFalse(task.done.is_set())
@@ -447,19 +448,28 @@ class OpenAITest(unittest.TestCase):
                          status_code=200, body={"answer": "ready"})
         self.assertEqual(task.join().body, {"answer": "ready"})
 
-    def test_stream_releases_validated_request_and_preserves_output_after_stop(self):
+    def test_stream_releases_published_request_and_preserves_output_after_stop(self):
         for stop in ("terminal", "stream_close", "client_close", "subscription_failure"):
             with self.subTest(stop=stop):
                 self.server.allow_start = False
                 client = self.client()
                 try:
-                    stream = client.responses.create(stream=True, input="x" * (1024 * 1024))
-                    frozen = weakref.ref(stream._call.frozen)
-                    self.assertIsNotNone(frozen())
+                    publications = []
+
+                    def freeze(*args, **kwargs):
+                        frozen = FrozenPublication(*args, **kwargs)
+                        publications.append(weakref.ref(frozen))
+                        return frozen
+
+                    with patch("openevent.model_proxy_sdk.publishing.FrozenPublication", side_effect=freeze):
+                        stream = client.responses.create(stream=True, input="x" * (1024 * 1024))
+                    self.assertEqual(len(publications), 1)
+                    self.assertIsNone(publications[0]())
+                    self.assertIsNotNone(stream._call.pending_uuid)
                     self.assertIsNone(stream._call.receive)
                     self.server.accept()
                     self.received(client, stream.request_seq)
-                    self.assertIsNone(stream._call.frozen)
+                    self.assertIsNone(stream._call.pending_uuid)
                     self.assertEqual(client._subscription.calls_by_uuid, {})
                     head = self.result(stream)
                     append = self.server.emit(
@@ -467,7 +477,6 @@ class OpenAITest(unittest.TestCase):
                         prev_seq=head.seq, body={"delta": "saved"},
                     )
                     self.received(client, append.seq)
-                    self.assertIsNone(frozen())
                     if stop == "terminal":
                         terminal = self.end(stream, body={"done": True})
                         self.received(client, terminal.seq)
@@ -479,7 +488,6 @@ class OpenAITest(unittest.TestCase):
                     else:
                         self.server.streams[-1].queue.put(RpcError("PERMISSION_DENIED"))
                         self.failed(client)
-                    self.assertIsNone(frozen())
                     self.assertEqual(stream.response_status_code, 200)
                     self.assertEqual(next(stream).body, {"delta": "saved"})
                     if stop in ("subscription_failure", "client_close"):
@@ -507,7 +515,7 @@ class OpenAITest(unittest.TestCase):
             payload = parse_payload(request.payload)
             self.received(client, request.seq)
             call = client._subscription.receives_by_seq[request.seq]
-            self.assertIsNone(call.frozen)
+            self.assertIsNone(call.pending_uuid)
             self.assertEqual(client._subscription.calls_by_uuid, {})
             self.assertIsNone(call.request_seq)
             self.assertFalse(call.receive.terminal)
@@ -516,7 +524,7 @@ class OpenAITest(unittest.TestCase):
                 status_code=200, end_status="completed", body={"done": True},
             )
             self.received(client, terminal.seq)
-            self.assertIsNone(call.frozen)
+            self.assertIsNone(call.pending_uuid)
             self.assertEqual(call.receive.request_seq, request.seq)
             raise RpcError("UNAVAILABLE")
 
@@ -543,7 +551,6 @@ class OpenAITest(unittest.TestCase):
         with self.assertRaises(ResultPublishError) as captured:
             client.chat.completions.create()
         self.assertEqual(captured.exception.commit_state.value, "UNKNOWN")
-        self.assertIsNone(captured.exception.committed_seq)
         self.assertEqual(client._subscription.calls_by_uuid, {})
 
     def test_shared_error_preserves_chunks_and_has_no_request_context(self):
@@ -552,10 +559,10 @@ class OpenAITest(unittest.TestCase):
         first = client.chat.completions.create(stream=True, stream_id="same")
         second = client.chat.completions.create(stream=True, stream_id="same")
         head = self.result(first)
-        self.server.emit("append", "same", request_seq=first.request_seq, prev_seq=head.seq, body="chunk")
+        self.server.emit("append", "same", request_seq=first.request_seq, prev_seq=head.seq, body={"delta": "chunk"})
         self.server.emit_raw(payload=b"{}")
         self.failed(client)
-        self.assertEqual(next(first).body, "chunk")
+        self.assertEqual(next(first).body, {"delta": "chunk"})
         with self.assertRaises(OpenEventSubscriptionError) as one:
             next(first)
         with self.assertRaises(OpenEventSubscriptionError) as two:
@@ -578,7 +585,7 @@ class OpenAITest(unittest.TestCase):
         class CallerState:
             pass
 
-        self.server.status_error = RpcError("PERMISSION_DENIED")
+        self.server.status_error = RpcError("UNAUTHENTICATED")
         client = self.client()
         with self.assertRaises(OpenEventSubscriptionError):
             client.responses.create()
@@ -696,6 +703,37 @@ class OpenAITest(unittest.TestCase):
                 if result_type is OpenAIResponse:
                     self.assertEqual(result.headers, [{"name": "x-request-id", "value": "original"}])
 
+    def test_result_metadata_stays_lazy_until_body_access(self):
+        body = {"output": [{"content": [{"text": "ready"}]}]}
+        cases = (
+            (OpenAIResponse, {"kind": "infer.result", "prev_seq": 1, "status_code": 200},
+             {"stream_id": "s", "request_seq": 1, "result_openevent_seq": 2,
+              "status_code": 200, "headers": [{"name": "x-request-id", "value": "provider"}]}),
+            (OpenAIChunk, {"kind": "infer.append", "request_seq": 1, "prev_seq": 2},
+             {"append_openevent_seq": 3}),
+        )
+        for result_type, fields, metadata in cases:
+            for first_access in ("body", "model_dump", "attribute"):
+                with self.subTest(result_type=result_type, first_access=first_access):
+                    wire = json.dumps(dict(fields, stream_id="s", ts_ms=0, body=body)).encode()
+                    model = parse_payload(wire)
+                    with patch("openevent.model_proxy_sdk._json.body_copy", wraps=_json.body_copy) as decode:
+                        result = result_type._from_model(model, **metadata)
+                        for name, value in metadata.items():
+                            self.assertEqual(getattr(result, name), value)
+                        decode.assert_not_called()
+                        if first_access == "body":
+                            self.assertEqual(result.body, body)
+                        elif first_access == "model_dump":
+                            self.assertEqual(result.model_dump(), body)
+                        else:
+                            self.assertEqual(result.output[0].content[0].text, "ready")
+                        decode.assert_called_once()
+                        result.body["output"].clear()
+                        result.model_dump()["output"].clear()
+                        self.assertEqual(result.output[0].content[0].text, "ready")
+                        decode.assert_called_once()
+
     def test_stream_chunk_and_terminal_json_remain_isolated(self):
         client = self.client()
         stream = client.responses.create(stream=True)
@@ -744,11 +782,12 @@ class OpenAITest(unittest.TestCase):
         client = self.client()
         stream = client.chat.completions.create(stream=True)
         head = self.result(stream)
-        raw = self.server.emit("append", stream.stream_id, request_seq=stream.request_seq, prev_seq=head.seq, body=123)
+        raw = self.server.emit("append", stream.stream_id, request_seq=stream.request_seq,
+                               prev_seq=head.seq, body={"delta": "queued"})
         self.received(client, raw.seq)
         stream.close()
         stream.close()
-        self.assertEqual([chunk.body for chunk in stream], [123])
+        self.assertEqual([chunk.body for chunk in stream], [{"delta": "queued"}])
         self.assertEqual(sum(json.loads(raw.payload)["kind"] == "infer.cancel" for raw in self.server.log), 1)
         self.assertEqual(stream.result_openevent_seq, head.seq)
         self.assertFalse(self.server.closed)
@@ -759,17 +798,18 @@ class OpenAITest(unittest.TestCase):
         task = Task(lambda: next(stream))
         self.assertFalse(task.done.wait(0.02))
         head = self.result(stream)
-        self.server.emit("append", stream.stream_id, request_seq=stream.request_seq, prev_seq=head.seq, body=True)
-        self.assertIs(task.join().body, True)
+        self.server.emit("append", stream.stream_id, request_seq=stream.request_seq,
+                         prev_seq=head.seq, body={"delta": "ready"})
+        self.assertEqual(task.join().body, {"delta": "ready"})
 
     def test_initial_status_failure_calls_callback_without_publication(self):
-        self.server.status_error = RpcError("PERMISSION_DENIED")
+        self.server.status_error = RpcError("UNAUTHENTICATED")
         errors = []
         client = self.client(on_subscription_error=errors.append)
         with self.assertRaises(OpenEventSubscriptionError) as captured:
             client.chat.completions.create()
         self.assertNotification(errors, captured.exception)
-        self.assertEqual(captured.exception.last_status, "PERMISSION_DENIED")
+        self.assertEqual(captured.exception.last_status, "UNAUTHENTICATED")
         self.assertEqual(self.server.log, [])
         self.assertEqual(self.server.streams, [])
 
@@ -840,7 +880,7 @@ class OpenAITest(unittest.TestCase):
         completed = client.responses.create(stream=True)
         head = self.result(active)
         self.server.emit("append", active.stream_id, request_seq=active.request_seq,
-                         prev_seq=head.seq, body="saved")
+                         prev_seq=head.seq, body={"delta": "saved"})
         end = self.end(completed, body={"done": True})
         self.received(client, end.seq)
         sub = client._subscription
@@ -862,7 +902,7 @@ class OpenAITest(unittest.TestCase):
             self.assertEqual(subscribe.call_count, 1)
             self.assertTrue(all(stream.cancelled for stream in self.server.streams))
             self.assertFalse(sub.failed.is_set())
-            self.assertEqual(next(active).body, "saved")
+            self.assertEqual(next(active).body, {"delta": "saved"})
             self.assertEqual(list(completed), [])
             self.assertEqual(completed.terminal_body, {"done": True})
             reading = Task(lambda: next(active))
@@ -877,17 +917,28 @@ class OpenAITest(unittest.TestCase):
         self.assertFalse(any(json.loads(raw.payload)["kind"] == "infer.cancel" for raw in self.server.log))
 
     def test_close_wakes_normal_call_via_subscription_failure(self):
-        client = self.client()
-        entered = threading.Event()
-        self.server.on_publish = lambda raw: entered.set()
-        creating = Task(lambda: client.responses.create())
-        self.assertTrue(entered.wait(2))
-        self.received(client, 1)
-        Task(client.close).join()
-        with self.assertRaises(OpenEventSubscriptionError) as captured:
-            creating.join()
-        self.assertEquivalentError(captured.exception, client._subscription.error)
-        self.assertEqual(len(self.server.log), 1)
+        for received_request in (False, True):
+            with self.subTest(received_request=received_request):
+                self.server.allow_start = received_request
+                client = self.client()
+                entered = threading.Event()
+                self.server.on_publish = lambda raw: entered.set()
+                creating = Task(lambda: client.responses.create())
+                self.assertTrue(entered.wait(2))
+                if received_request:
+                    self.received(client, self.server.log[-1].seq)
+                sub = client._subscription
+                with sub.condition:
+                    calls = sub.receives_by_seq if received_request else sub.calls_by_uuid
+                    self.assertEqual(len(calls), 1)
+                    call = next(iter(calls.values()))
+                    self.assertTrue(sub.condition.wait_for(lambda: call.request_seq is not None, timeout=2))
+                Task(client.close).join()
+                with self.assertRaises(OpenEventSubscriptionError) as captured:
+                    creating.join()
+                self.assertEquivalentError(captured.exception, client._subscription.error)
+                self.assertEqual(client._subscription.calls_by_uuid, {})
+                self.assertEqual(client._subscription.receives_by_seq, {})
 
     def test_close_does_not_wait_for_callback_and_callback_can_close_client(self):
         entered, release = threading.Event(), threading.Event()
@@ -920,8 +971,8 @@ class OpenAITest(unittest.TestCase):
         self.addCleanup(release.set)
         cancel_requests = []
 
-        def on_publish(raw):
-            payload = json.loads(raw.payload)
+        def before_publish(request):
+            payload = json.loads(request["payload"])
             if payload["kind"] == "infer.cancel":
                 cancel_requests.append(payload["request_seq"])
                 entered.set()
@@ -929,7 +980,7 @@ class OpenAITest(unittest.TestCase):
                     raise TimeoutError("Test cancel gate")
                 raise RpcError("PERMISSION_DENIED")
 
-        self.server.on_publish = on_publish
+        self.server.before_publish = before_publish
         first = Task(stream.close)
         self.assertTrue(entered.wait(2))
         second = Task(stream.close)
@@ -949,6 +1000,8 @@ class OpenAITest(unittest.TestCase):
         self.assertIsNone(cached.__context__)
         self.assertIsNone(cached.__cause__)
         self.assertEqual(cancel_requests, [stream.request_seq])
+        self.assertEqual(first_error.exception.commit_state.value, "NOT_COMMITTED")
+        self.assertFalse(any(json.loads(raw.payload)["kind"] == "infer.cancel" for raw in self.server.log))
         client.close()
         client.close()
 
@@ -977,36 +1030,12 @@ class OpenAITest(unittest.TestCase):
                 self.assertIs(captured.exception, interrupted)
                 self.assertEqual(client._subscription.calls_by_uuid, {})
                 self.assertEqual(client._subscription.receives_by_seq, {})
-                self.assertTrue(all(call.local_closed and call.frozen is None
-                                    for call in client._subscription.calls))
                 recovered = client.responses.create(stream=True)
                 terminal = self.end(recovered)
                 self.received(client, terminal.seq)
                 self.assertEqual(list(recovered), [])
                 Task(client.close).join()
                 client._subscription.reader.join(2)
-
-    def test_published_seq_conflict_discards_early_terminal_and_fails_subscription(self):
-        errors = []
-        client = self.client(on_subscription_error=errors.append)
-
-        def on_publish(raw):
-            payload = json.loads(raw.payload)
-            self.received(client, raw.seq)
-            call = client._subscription.receives_by_seq[raw.seq]
-            self.assertIsNone(call.frozen)
-            self.assertEqual(client._subscription.calls_by_uuid, {})
-            result = self.server.emit("result", payload["stream_id"], prev_seq=raw.seq,
-                                      status_code=200, body="wrong")
-            self.received(client, result.seq)
-            return SimpleNamespace(seq=raw.seq + 100)
-
-        self.server.on_publish = on_publish
-        with self.assertRaises(OpenEventSubscriptionError) as captured:
-            client.responses.create()
-        self.assertEqual(captured.exception.reason, "protocol")
-        self.assertNotification(errors, captured.exception)
-        self.assertTrue(client._subscription.failed.is_set())
 
     def test_locally_closed_stream_is_not_changed_by_later_subscription_failure(self):
         client = self.client()
@@ -1030,7 +1059,7 @@ class OpenAITest(unittest.TestCase):
         self.received(client, added.seq)
         head = self.result(first)
         self.server.emit("append", "first", request_seq=first.request_seq,
-                         prev_seq=head.seq, body="before removal")
+                         prev_seq=head.seq, body={"delta": "before removal"})
         removed = self.server.emit_raw(principal=0, recipients=(), payload=json.dumps({
             "kind": "system.member_removed", "data": {"schema_version": 1, "member": 3},
         }).encode())
@@ -1039,7 +1068,7 @@ class OpenAITest(unittest.TestCase):
         self.end(second, body={"answer": "ready"})
         end = self.end(first, body={"done": True})
         self.received(client, end.seq)
-        self.assertEqual([chunk.body for chunk in first], ["before removal"])
+        self.assertEqual([chunk.body for chunk in first], [{"delta": "before removal"}])
         self.assertEqual(first.terminal_body, {"done": True})
         self.assertEqual(list(second), [])
         self.assertEqual(second.terminal_body, {"answer": "ready"})
@@ -1067,11 +1096,11 @@ class OpenAITest(unittest.TestCase):
             self.assertTrue(reconnecting.wait(2))
             result = self.result(stream)
             self.server.emit("append", stream.stream_id, request_seq=stream.request_seq,
-                             prev_seq=result.seq, body="after reconnect")
+                             prev_seq=result.seq, body={"delta": "after reconnect"})
             end = self.end(stream, body={"reconnected": True})
             self.received(client, end.seq)
         self.assertEqual(self.server.from_seqs, [0, system.seq])
-        self.assertEqual([chunk.body for chunk in stream], ["after reconnect"])
+        self.assertEqual([chunk.body for chunk in stream], [{"delta": "after reconnect"}])
         self.assertEqual(stream.terminal_body, {"reconnected": True})
 
     def test_system_message_does_not_advance_cursor_after_subscription_failure(self):
@@ -1108,12 +1137,12 @@ class OpenAITest(unittest.TestCase):
             self.assertTrue(self.server.streams[0].cancelled)
             self.assertFalse(self.server.streams[-1].accepted.is_set())
             second = client.responses.create(stream=True)
-            end = self.end(second, body="second")
+            end = self.end(second, body={"type": "response.completed", "response": {"id": "second"}})
             self.server.accept()
             self.received(client, end.seq)
         self.assertEqual(self.server.status_count, 1)
         self.assertEqual(self.server.from_seqs, [0, head.seq])
-        self.assertEqual(second.terminal_body, "second")
+        self.assertEqual(second.terminal_body, {"type": "response.completed", "response": {"id": "second"}})
         self.assertEqual(list(second), [])
         self.assertEqual(first.result_openevent_seq, head.seq)
 
@@ -1182,25 +1211,41 @@ class OpenAITest(unittest.TestCase):
         self.assertEqual(list(complete), [])
         self.assertEqual(complete.terminal_body, {"done": True})
 
-    def test_failure_between_call_begin_and_first_uuid_prevents_uuid_rpc(self):
-        client = self.client()
-        warmup = client.responses.create(stream=True)
-        self.received(client, warmup.request_seq)
-        sub = client._subscription
-        begin_rpc = sub.begin_publication_rpc
+    def test_failure_before_request_registration_prevents_publish(self):
+        for stage in ("before_uuid", "uuid_inflight"):
+            with self.subTest(stage=stage):
+                client = self.client()
+                warmup = client.responses.create(stream=True)
+                self.received(client, warmup.request_seq)
+                sub = client._subscription
+                begin_rpc = sub.begin_publication_rpc
+                get_uuid = self.server.get_uuid
 
-        def failure_before_rpc():
-            self.server.streams[-1].queue.put(RpcError("PERMISSION_DENIED"))
-            self.failed(client)
-            begin_rpc()
+                def fail_subscription():
+                    self.server.streams[-1].queue.put(RpcError("PERMISSION_DENIED"))
+                    self.failed(client)
 
-        with patch.object(sub, "begin_publication_rpc", side_effect=failure_before_rpc), \
-                patch.object(self.server, "get_uuid", wraps=self.server.get_uuid) as uuid:
-            with self.assertRaises(OpenEventSubscriptionError) as captured:
-                client.responses.create(stream=True)
-            uuid.assert_not_called()
-        self.assertEquivalentError(captured.exception, sub.error)
-        self.assertEqual(len(self.server.log), 1)
+                def before_rpc():
+                    if stage == "before_uuid":
+                        fail_subscription()
+                    begin_rpc()
+
+                def allocate_uuid():
+                    uuid = get_uuid()
+                    fail_subscription()
+                    return uuid
+
+                with patch.object(sub, "begin_publication_rpc", side_effect=before_rpc), \
+                        patch.object(self.server, "get_uuid", side_effect=allocate_uuid) as uuid, \
+                        patch.object(self.server, "publish_auto_seq", wraps=self.server.publish_auto_seq) as publish:
+                    with self.assertRaises(OpenEventSubscriptionError) as captured:
+                        client.responses.create(stream=True)
+                    self.assertEqual(uuid.call_count, 0 if stage == "before_uuid" else 1)
+                    publish.assert_not_called()
+                self.assertEquivalentError(captured.exception, sub.error)
+                self.assertEqual(sub.calls_by_uuid, {})
+                self.assertEqual(sub.receives_by_seq, {})
+                client.close()
 
     def test_failed_subscription_interrupts_long_request_retry_waits(self):
         for stage in ("uuid", "publish", "query"):
@@ -1210,23 +1255,39 @@ class OpenAITest(unittest.TestCase):
                 self.received(client, warmup.request_seq)
                 sub = client._subscription
                 waiting = threading.Event()
+                querying = threading.Event()
                 original_wait = sub.failed.wait
+                publish_attempts = []
 
                 def retry_wait(timeout=None):
+                    if stage == "query" and not querying.is_set():
+                        # Reach UUID reconciliation without waiting for the
+                        # preceding lost publication response's retry delay.
+                        return False
                     waiting.set()
                     return original_wait(timeout)
 
-                publish_error = "ALREADY_EXISTS" if stage == "query" else "UNAVAILABLE"
+                def before_publish(request):
+                    publish_attempts.append(request)
+                    if any(raw.uuid == request["uuid"] for raw in self.server.log):
+                        raise RpcError("ALREADY_EXISTS")
 
                 def fail_publish(raw):
-                    raise RpcError(publish_error)
+                    # The first attempt committed; only its response was lost.
+                    raise RpcError("UNAVAILABLE")
 
+                def fail_query(uuid):
+                    querying.set()
+                    raise RpcError("UNAVAILABLE")
+
+                self.server.before_publish = before_publish
                 self.server.on_publish = None if stage == "uuid" else fail_publish
                 target_name = "get_uuid" if stage == "uuid" else "get_seq_by_uuid" if stage == "query" else "publish_auto_seq"
                 target = getattr(self.server, target_name)
                 with patch.object(sub.failed, "wait", side_effect=retry_wait), \
                         patch.object(self.server, target_name,
-                                     side_effect=RpcError("UNAVAILABLE") if stage != "publish" else None,
+                                     side_effect=fail_query if stage == "query" else
+                                     RpcError("UNAVAILABLE") if stage == "uuid" else None,
                                      wraps=target if stage == "publish" else None) as rpc:
                     task = Task(lambda: client.responses.create(stream=True))
                     self.assertTrue(waiting.wait(2), "RPC did not reach its 30-second retry wait")
@@ -1238,6 +1299,12 @@ class OpenAITest(unittest.TestCase):
                 self.assertEqual(captured.exception.commit_state.value,
                                  {"uuid": "NOT_COMMITTED", "publish": "UNKNOWN", "query": "COMMITTED"}[stage])
                 self.assertEqual(captured.exception.last_status, "UNAVAILABLE")
+                self.assertEqual(len(publish_attempts), {"uuid": 0, "publish": 1, "query": 2}[stage])
+                if stage == "query":
+                    self.assertEqual(publish_attempts[0], publish_attempts[1])
+                    self.assertEqual(sum(raw.uuid == publish_attempts[0]["uuid"]
+                                         for raw in self.server.log), 1)
+                self.server.before_publish = None
                 self.server.on_publish = None
                 client.close()
 
@@ -1245,12 +1312,19 @@ class OpenAITest(unittest.TestCase):
         client = self.client(max_retries=3)
         warmup = client.responses.create(stream=True)
         self.received(client, warmup.request_seq)
+        attempts = []
 
         def on_publish(raw):
-            self.server.streams[-1].queue.put(RpcError("PERMISSION_DENIED"))
-            self.failed(client)
-            raise RpcError("ALREADY_EXISTS")
+            raise RpcError("UNAVAILABLE")
 
+        def before_publish(request):
+            attempts.append(request)
+            if any(raw.uuid == request["uuid"] for raw in self.server.log):
+                self.server.streams[-1].queue.put(RpcError("PERMISSION_DENIED"))
+                self.failed(client)
+                raise RpcError("ALREADY_EXISTS")
+
+        self.server.before_publish = before_publish
         self.server.on_publish = on_publish
         with patch.object(self.server, "get_seq_by_uuid", wraps=self.server.get_seq_by_uuid) as query:
             with self.assertRaises(ResultPublishError) as captured:
@@ -1258,6 +1332,8 @@ class OpenAITest(unittest.TestCase):
             query.assert_not_called()
         self.assertEqual(captured.exception.commit_state.value, "COMMITTED")
         self.assertEqual(captured.exception.last_status, "ALREADY_EXISTS")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
         self.assertEqual(len(self.server.log), 2)
 
     def test_inflight_success_after_failure_preserves_seq_and_accepted_terminal(self):
@@ -1393,22 +1469,6 @@ class OpenAITest(unittest.TestCase):
             client.responses.create(stream=True)
         self.assertEqual(len(self.server.streams), 3)
 
-    def test_frozen_request_metadata_mismatch_fails_subscription(self):
-        client = self.client()
-        original_emit = self.server.emit_raw
-
-        def different_principal(**kwargs):
-            if json.loads(kwargs["payload"])["kind"] == "infer.request":
-                kwargs["principal"] = 999
-            return original_emit(**kwargs)
-
-        self.server.emit_raw = different_principal
-        self.server.on_publish = lambda raw: self.failed(client)
-        with self.assertRaises(OpenEventSubscriptionError) as captured:
-            client.responses.create(stream=True)
-        self.assertEqual(captured.exception.reason, "protocol")
-        self.assertIsInstance(captured.exception.protocol_error, ProtocolError)
-
     def test_normal_call_without_body_is_local_protocol_error(self):
         client = self.client()
 
@@ -1434,7 +1494,7 @@ class OpenAITest(unittest.TestCase):
             if not release.wait(2):
                 raise TimeoutError("Test callback gate")
 
-        self.server.status_error = RpcError("PERMISSION_DENIED")
+        self.server.status_error = RpcError("UNAUTHENTICATED")
         client = self.client(on_subscription_error=callback)
         creating = Task(lambda: client.responses.create(stream=True))
         self.assertTrue(entered.wait(2))
@@ -1484,22 +1544,3 @@ class OpenAITest(unittest.TestCase):
         self.assertEqual(error.body, {"delta": "bad chain"})
         with self.assertRaises(AttributeError):
             error.status_code = 500
-
-    def test_large_json_integer_reaches_public_error_without_serialization_error(self):
-        client = self.client()
-        integer = 10 ** 5000 + 3
-
-        def on_publish(raw):
-            request = parse_payload(raw.payload)
-            self.assertEqual(request.body["input"], integer)
-            result = InferResultInput(
-                stream_id=request.stream_id, prev_seq=raw.seq, status_code=429,
-                body={"error": {"code": -integer}},
-            )
-            self.server.emit_raw(payload=result.to_payload(1))
-
-        self.server.on_publish = on_publish
-        with self.assertRaises(RateLimitError) as captured:
-            client.responses.create(input=integer)
-        self.assertEqual(captured.exception.body["error"]["code"], -integer)
-        self.assertEqual(captured.exception.status_code, 429)

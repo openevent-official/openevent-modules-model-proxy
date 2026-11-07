@@ -2,7 +2,8 @@
 
 [English version](SDK_USAGE.md)
 
-安装见 [README_cn.md](../README_cn.md#构建和测试)，完整 API 见 [SDK_API_cn.md](SDK_API_cn.md)。
+安装见 [README_cn.md](../README_cn.md#构建和测试)；`make install` 会按包声明补齐运行依赖。
+完整 API 见 [SDK_API_cn.md](SDK_API_cn.md)。
 
 ## 1. OpenAI-like 客户端
 

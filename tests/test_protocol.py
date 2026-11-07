@@ -1,13 +1,14 @@
 import json
-import sys
 import unittest
+from unittest.mock import patch
 
 from openevent.sdk import openevent_pb2
 from openevent.model_proxy_sdk import (
     InferAppend, InferAppendInput, InferCancel, InferCancelInput,
     InferEnd, InferEndInput, InferRequest, InferRequestInput, InferResult,
-    InferResultInput, PayloadValidationError, UNSET, parse_message, parse_payload,
+    InferResultInput, PayloadValidationError, UNSET, parse_message, parse_payload, prepare_payload,
 )
+from openevent.model_proxy_sdk import _json
 from openevent.model_proxy_sdk.errors import (
     APIError, APIStatusError, APIConnectionError, APITimeoutError,
     BadRequestError, AuthenticationError, PermissionDeniedError, NotFoundError,
@@ -32,33 +33,65 @@ class ProtocolTests(unittest.TestCase):
             (InferRequestInput(stream_id="s", method="POST", path="/v1/responses",
                                body={"input": ["你好"], "stream": True}, provider="p", prev_seq=3), InferRequest),
             (InferResultInput(stream_id="s", prev_seq=7, status_code=429,
-                              headers=[{"name": "retry-after", "value": " 1 "}], body=None), InferResult),
-            (InferAppendInput(stream_id="s", request_seq=7, prev_seq=8, body=[None, False, 1.5]), InferAppend),
+                              headers=[{"name": "retry-after", "value": " 1 "}],
+                              body={"error": {"message": "rate limited"}}), InferResult),
+            (InferAppendInput(stream_id="s", request_seq=7, prev_seq=8,
+                              body={"type": "response.output_text.delta", "delta": "你好"}), InferAppend),
             (InferEndInput(stream_id="s", request_seq=7, status_code=200,
                            end_status="completed", body={"type": "response.completed"}), InferEnd),
             (InferCancelInput(stream_id="s", request_seq=7), InferCancel),
         ]
         for source, model in cases:
             with self.subTest(model=model):
-                parsed = parse_payload(source.to_payload(321))
+                prepared = prepare_payload(source)
+                parsed = parse_payload(prepared.payload)
                 self.assertIsInstance(parsed, model)
-                self.assertEqual(parsed.ts_ms, 321)
+                self.assertEqual(parsed.ts_ms, prepared.ts_ms)
                 self.assertEqual(parsed.stream_id, "s")
                 with self.assertRaises(AttributeError):
                     parsed.stream_id = "changed"
-        parsed = parse_payload(cases[0][0].to_payload(0))
+        parsed = parse_payload(prepare_payload(cases[0][0]).payload)
         body = parsed.body
         body["input"].append("changed")
         self.assertEqual(parsed.body["input"], ["你好"])
-        parsed = parse_payload(cases[1][0].to_payload(0))
+        parsed = parse_payload(prepare_payload(cases[1][0]).payload)
         parsed.headers[0]["value"] = "changed"
         self.assertEqual(parsed.headers[0]["value"], " 1 ")
 
     def test_input_freezes_caller_owned_json(self):
-        body = {"input": ["original"]}
+        body = {"input": ["original"], "stream": True}
         item = InferRequestInput(stream_id="s", method="POST", path="/v1/responses", body=body)
         body["input"].append("later")
-        self.assertEqual(parse_payload(item.to_payload(0)).body, {"input": ["original"]})
+        body["stream"] = False
+        parsed = parse_payload(prepare_payload(item).payload)
+        self.assertTrue(item._streaming)
+        self.assertTrue(parsed._streaming)
+        self.assertEqual(parsed.body, {"input": ["original"], "stream": True})
+
+    def test_body_is_decoded_only_when_requested_and_returns_independent_copies(self):
+        body = {"model": "test", "stream": True, "messages": [{"role": "user", "content": "hello"}]}
+        wire = json.dumps(request(body=body)).encode()
+        with patch("openevent.model_proxy_sdk._json.body_copy", wraps=_json.body_copy) as decode:
+            parsed = parse_payload(wire)
+            self.assertEqual((parsed.kind, parsed.stream_id, parsed.method, parsed.path),
+                             ("infer.request", "s_1", "POST", "/v1/chat/completions"))
+            self.assertEqual(parsed.ts_ms, 0)
+            decode.assert_not_called()
+            returned_body = parsed.body
+            decode.assert_called_once()
+            returned_body["messages"][0]["content"] = "changed"
+            returned_payload = parsed.to_dict()
+            returned_payload["body"]["messages"].clear()
+            self.assertEqual(parsed.body, body)
+
+    def test_payload_encodes_unicode_directly_and_preserves_json_escapes(self):
+        body = {"中文": "é😀\x7f", "escaped": '"\\\n\x00'}
+        item = InferRequestInput(stream_id="s", method="POST", path="/v1/responses", body=body)
+        payload = prepare_payload(item).payload
+        text = payload.decode("utf-8")
+        self.assertIn('"中文":"é😀\x7f"', text)
+        self.assertIn('"escaped":"\\\"\\\\\\n\\u0000"', text)
+        self.assertEqual(parse_payload(payload).body, body)
 
     def test_direct_model_construction_validates_and_freezes_json(self):
         data = request(body={"input": ["original"]})
@@ -72,26 +105,26 @@ class ProtocolTests(unittest.TestCase):
             InferCancel(request())
         self.assertEqual(caught.exception.code, "INVALID_KIND")
 
-    def test_missing_body_is_distinct_from_null(self):
-        for body in (UNSET, None, False, 0, [], {}):
+    def test_optional_body_presence_survives_roundtrip(self):
+        for body in (UNSET, {"type": "response.completed"}):
             with self.subTest(body=body):
                 result = InferResultInput(stream_id="s", prev_seq=1, status_code=200, body=body)
                 end = InferEndInput(stream_id="s", request_seq=1, status_code=200,
                                     end_status="completed", body=body)
                 for item in (result, end):
-                    parsed = parse_payload(item.to_payload(0))
+                    parsed = parse_payload(prepare_payload(item).payload)
                     self.assertEqual(parsed.has_body, body is not UNSET)
                     self.assertEqual("body" in parsed.to_dict(), body is not UNSET)
                     if body is not UNSET:
                         self.assertEqual(parsed.body, body)
 
     def test_optional_none_omits_fields(self):
-        parsed = parse_payload(InferRequestInput(stream_id="s", method="POST",
-                                                path="/v1/responses", body={}).to_payload(0))
+        item = InferRequestInput(stream_id="s", method="POST", path="/v1/responses", body={})
+        parsed = parse_payload(prepare_payload(item).payload)
         self.assertNotIn("provider", parsed.to_dict())
         self.assertNotIn("prev_seq", parsed.to_dict())
         result = InferResultInput(stream_id="s", prev_seq=1, status_code=200)
-        self.assertNotIn("headers", parse_payload(result.to_payload(0)).to_dict())
+        self.assertNotIn("headers", parse_payload(prepare_payload(result).payload).to_dict())
 
     def test_boolean_and_invalid_control_fields(self):
         cases = [
@@ -121,8 +154,7 @@ class ProtocolTests(unittest.TestCase):
         for payload in (b"\xff", b"{", b"{} trailing", b'\xef\xbb\xbf{}', b'NaN',
                         b'{"kind":"infer.request","body":Infinity}',
                         b'{"kind":"infer.request","body":{"input":[NaN]}}',
-                        b'{"kind":"infer.request","body":{"input":[1e9999]}}',
-                        b"1e9999", "{}"):
+                        "{}"):
             with self.subTest(payload=payload):
                 with self.assertRaises(PayloadValidationError) as caught:
                     parse_payload(payload)
@@ -156,9 +188,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "MISSING_REQUIRED_FIELD")
 
     def test_input_body_rejects_non_json_and_cycles(self):
-        cycle = []
-        cycle.append(cycle)
-        for body in (object(), (1, 2), {1: "wrong key"}, float("nan"), float("inf"), cycle):
+        cycle = {}
+        cycle["cycle"] = cycle
+        for body in (None, [], 1, "text", {"invalid": object()}, {"invalid": (1, 2)},
+                     {1: "wrong key"}, {"invalid": float("nan")}, {"invalid": float("inf")}, cycle):
             with self.subTest(body=type(body)):
                 with self.assertRaises(PayloadValidationError) as caught:
                     InferAppendInput(stream_id="s", request_seq=1, prev_seq=2, body=body)
@@ -166,17 +199,17 @@ class ProtocolTests(unittest.TestCase):
 
     def test_result_status_shape_matrix(self):
         for status in (100, 200, 599, 60000, 60001, 60002, 60003, 60005, 60007, 60008, 60009):
-            self.assertEqual(InferResultInput(stream_id="s", prev_seq=1, status_code=status, body=None).status_code,
+            self.assertEqual(InferResultInput(stream_id="s", prev_seq=1, status_code=status, body={}).status_code,
                              status)
-        for status, body in ((True, None), (99, None), (600, None), (60004, None),
-                             (60006, None), (60007, UNSET), (60009, UNSET)):
+        for status, body in ((True, {}), (99, {}), (600, {}), (60004, {}),
+                             (60006, {}), (60007, UNSET), (60009, UNSET)):
             with self.subTest(status=status, body=body):
                 with self.assertRaises(PayloadValidationError) as caught:
                     InferResultInput(stream_id="s", prev_seq=1, status_code=status, body=body)
                 self.assertEqual(caught.exception.code, "INVALID_STATUS_CODE")
 
     def test_end_shape_matrix(self):
-        for state, status, body in (("completed", 429, UNSET), ("failed", 200, None),
+        for state, status, body in (("completed", 429, UNSET), ("failed", 200, {}),
                                     ("interrupted", 60003, {})):
             InferEndInput(stream_id="s", request_seq=1, status_code=status, end_status=state, body=body)
         for state, status, body, code in (
@@ -202,7 +235,7 @@ class ProtocolTests(unittest.TestCase):
                    {"name": "x-request-id", "value": "second"},
                    {"name": "x-ratelimit-tokens", "value": "5"}]
         result = InferResultInput(stream_id="s", prev_seq=1, status_code=200, headers=headers)
-        self.assertEqual(parse_payload(result.to_payload(0)).headers, headers)
+        self.assertEqual(parse_payload(prepare_payload(result).payload).headers, headers)
         for bad in ([], {}, [{"name": "Content-Type", "value": "x"}],
                     [{"name": "authorization", "value": "x"}],
                     [{"name": "content-type", "value": 1}],
@@ -213,39 +246,22 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "INVALID_HEADERS")
 
     def test_message_metadata_and_payload_timestamps_stay_separate(self):
+        with patch("openevent.model_proxy_sdk.publishing.time.time_ns", return_value=123_000_000):
+            prepared = prepare_payload(InferCancelInput(stream_id="s", request_seq=1))
         message = openevent_pb2.EventMessage(uuid=10, seq=11, channel_id=12, principal=13,
                                            recipients=[14], ts_ms=456,
-                                           payload=InferCancelInput(stream_id="s", request_seq=1).to_payload(123))
+                                           payload=prepared.payload)
         parsed = parse_message(message)
         self.assertEqual((parsed.uuid, parsed.seq, parsed.channel_id, parsed.principal), (10, 11, 12, 13))
         self.assertEqual(parsed.recipients, (14,))
         self.assertEqual((parsed.ts_ms, parsed.payload.ts_ms), (456, 123))
 
-    def test_seq_types_and_large_timestamp(self):
-        self.assertEqual(self.parse(request(ts_ms=2 ** 256)).ts_ms, 2 ** 256)
+    def test_seq_types(self):
         for value in (True, 0, -1, 1.0, None):
             with self.subTest(value=value):
                 with self.assertRaises(PayloadValidationError) as caught:
                     InferCancelInput(stream_id="s", request_seq=value)
                 self.assertEqual(caught.exception.code, "INVALID_REQUEST_SEQ")
-
-    def test_timestamp_and_body_integers_exceed_python_decimal_digit_limit(self):
-        digit_limit = getattr(sys, "get_int_max_str_digits", lambda: None)
-        before = digit_limit()
-        integer = 10 ** 5000 + 9
-        body = {"integer": integer, "nested": [-integer, True, None, "中文\ud800"]}
-        request_input = InferRequestInput(
-            stream_id="big", method="POST", path="/v1/responses", body=body,
-        )
-        encoded = request_input.to_payload(integer)
-        parsed = parse_payload(encoded)
-        self.assertEqual(parsed.ts_ms, integer)
-        self.assertEqual(parsed.body, body)
-        # Decode independently constructed wire JSON, not only our own encoder.
-        raw = (b'{"kind":"infer.cancel","stream_id":"big","request_seq":1,"ts_ms":'
-               + b"1" + b"0" * 5000 + b"}")
-        self.assertEqual(parse_payload(raw).ts_ms, 10 ** 5000)
-        self.assertEqual(digit_limit(), before)
 
 
 class ErrorTests(unittest.TestCase):

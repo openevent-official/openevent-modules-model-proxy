@@ -8,6 +8,7 @@ import threading
 import time
 
 from openevent.sdk import OpenEventClient
+from msgspec import Raw
 from openevent.model_proxy_sdk import (
     InferAppend, InferAppendInput, InferCancel, InferEnd, InferEndInput,
     InferRequest, InferResult, InferResultInput, UNSET, create_client, parse_message,
@@ -44,7 +45,7 @@ class RequestState:
     stream_id: str
     streaming: bool
     path: str
-    body: dict | None = field(default=None, repr=False)
+    body: Raw | None = field(default=None, repr=False)
     received_at: float = field(default_factory=time.monotonic)
     duplicate: bool = False
     provider: str | None = None
@@ -122,10 +123,7 @@ class Worker:
                 description = json.loads(channel.description)
                 valid = (
                     type(description) is dict
-                    and description.keys() == {"version", "updated_at_ms", "metadata"}
-                    and description["version"] == "v1"
-                    and type(description["updated_at_ms"]) is int
-                    and description["updated_at_ms"] >= 0
+                    and description.keys() == {"metadata"}
                     and type(description["metadata"]) is dict
                 )
             except (ValueError, TypeError):
@@ -149,7 +147,7 @@ class Worker:
 
     def _accept(self, parsed, *, historical=False, payload_bytes=0):
         payload = parsed.payload
-        # Parsed models own their JSON; the Worker and Provider only read it.
+        # Keep the encoded body through scheduling and HTTP forwarding.
         body = payload._data["body"] if isinstance(payload, InferRequest) else None
         abort = None
         with self.condition:
@@ -161,7 +159,7 @@ class Worker:
                 key = (parsed.channel_id, payload.stream_id)
                 state = RequestState(
                     parsed.channel_id, parsed.seq, parsed.principal, payload.stream_id,
-                    body.get("stream", False), payload.path, duplicate=key in self.originals,
+                    payload._streaming, payload.path, duplicate=key in self.originals,
                 )
                 self.originals.add(key)
                 self.requests[parsed.seq] = state
@@ -218,19 +216,13 @@ class Worker:
         target = self._rpc(lambda: self.client.get_status(
             principal=self.config.principal, token=self.config.token)).max_seq
         cursor = 1
-        previous = 0
         while cursor <= target:
             page = self._rpc(lambda: self.client.fetch(
                 principal=self.config.principal, token=self.config.token, from_seq=cursor,
                 limit=1000, only_my_recipient=False, channels=self.config.channels))
-            if page.next_seq <= cursor:
-                raise WorkerFatalError("History scan did not advance")
             for message in page.messages:
                 if message.seq > target:
                     break
-                if message.seq < cursor or message.seq <= previous:
-                    raise WorkerFatalError("History is not ordered")
-                previous = message.seq
                 if message.principal != 0:
                     self._accept(self._parse(message), historical=True)
             cursor = page.next_seq
@@ -293,7 +285,7 @@ class Worker:
                 body, state.body = state.body, None
             operation = self.provider_factory(
                 self.config.providers[state.provider], body, state.path,
-                self.config.max_payload_bytes)
+                self.config.max_payload_bytes, streaming=state.streaming)
             body = None
             with self.condition:
                 if not self._can_output(state):
@@ -314,7 +306,7 @@ class Worker:
                     event = InferResultInput(
                         **common, prev_seq=state.request_seq, status_code=output.status_code,
                         headers=output.headers or None,
-                        body=output.body if output.has_body else UNSET)
+                        body=output.body if output.body is not None else UNSET)
                 elif output.kind == "append":
                     if writer_seq is None:
                         raise WorkerFatalError("Provider yielded append before response headers")
@@ -323,7 +315,7 @@ class Worker:
                 elif output.kind in ("completed", "failed"):
                     event = InferEndInput(
                         **common, request_seq=state.request_seq, status_code=output.status_code,
-                        end_status=output.kind, body=output.body if output.has_body else UNSET)
+                        end_status=output.kind, body=output.body if output.body is not None else UNSET)
                 else:
                     raise WorkerFatalError("Unknown Provider event")
                 writer_seq = self._emit(state, event)

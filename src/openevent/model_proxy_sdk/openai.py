@@ -4,8 +4,10 @@ from copy import deepcopy
 from types import SimpleNamespace
 from uuid import uuid4
 
+import msgspec
 from openevent.sdk import OpenEventClient
 
+from . import _json
 from .errors import ConfigurationError, ProtocolError, StreamCancelledError, _copy_error, make_api_error
 from .models import InferCancelInput, InferRequestInput
 from .publishing import create_client, publish_cancel, publish_request
@@ -57,7 +59,7 @@ class _JSONResult:
 
     @classmethod
     def _from_model(cls, model, **metadata):
-        # Protocol models already own their JSON and never mutate it.
+        # Keep the model's encoded body until the caller reads its contents.
         result = object.__new__(cls)
         object.__setattr__(result, "_body", model._data["body"])
         object.__setattr__(result, "_metadata", metadata)
@@ -68,14 +70,20 @@ class _JSONResult:
 
     @property
     def body(self):
-        return deepcopy(self._body)
+        return deepcopy(self._decoded_body())
 
     def model_dump(self):
-        return deepcopy(self._body)
+        return self.body
+
+    def _decoded_body(self):
+        if isinstance(self._body, msgspec.Raw):
+            object.__setattr__(self, "_body", _json.body_copy(self._body))
+        return self._body
 
     def __getattr__(self, name):
-        if isinstance(self._body, dict) and name in self._body:
-            return _view(self._body[name])
+        body = self._decoded_body()
+        if name in body:
+            return _view(body[name])
         raise AttributeError(name)
 
 
@@ -226,14 +234,14 @@ class OpenAI:
         )
         # The input owns its snapshot; the endpoint shares this kwargs dict.
         kwargs.clear()
-        streaming = request._data["body"].get("stream", False)
+        streaming = request._streaming
         sub = self._subscription
         sub.prepare()
         call = sub.begin(request.stream_id, streaming)
         try:
             seq = publish_request(
                 self._protocol, self._channel_id, self._principal, request,
-                before_publish=lambda frozen: sub.register(call, frozen),
+                before_publish=lambda frozen: sub.register(call, frozen.uuid),
                 before_rpc=sub.begin_publication_rpc, stop_event=sub.failed,
             )
             sub.published(call, seq)
