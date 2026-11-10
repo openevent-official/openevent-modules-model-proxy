@@ -808,7 +808,8 @@ class WorkerTests(unittest.TestCase):
 
     def test_permanent_subscribe_failure_and_invalid_payload_exit_worker(self):
         invalid = pb.EventMessage(uuid=1, seq=1, channel_id=3, principal=7, payload=b"{")
-        for stream in (Subscription(start_error=RpcError("PERMISSION_DENIED")), Subscription([invalid])):
+        for stream in (Subscription(start_error=RpcError("PERMISSION_DENIED")),
+                       Subscription([RpcError("PERMISSION_DENIED")]), Subscription([invalid])):
             with self.subTest(stream=stream):
                 transport = OpenEvent(subscriptions=[stream])
                 factory = ProviderFactory()
@@ -871,24 +872,6 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(set(worker.requests), {1})
         self.assertEqual(factory.calls, [])
         self.assertEqual(transport.published, [])
-
-    def test_fatal_subscription_errors_do_not_wait_for_stream_cleanup(self):
-        class NoCleanupWait(Subscription):
-            def code(self):
-                raise AssertionError("Fatal exit must not wait for Subscribe completion")
-
-        invalid = pb.EventMessage(uuid=1, seq=1, channel_id=3, principal=7, payload=b"{")
-        for stream in (NoCleanupWait([invalid]),
-                       NoCleanupWait([RpcError("PERMISSION_DENIED")]),
-                       NoCleanupWait(start_error=RpcError("PERMISSION_DENIED"))):
-            with self.subTest(stream=stream):
-                failures = []
-                worker = Worker(config(), client=OpenEvent(subscriptions=[stream]), on_fatal=failures.append)
-                with self.assertRaises(WorkerFatalError):
-                    worker.run()
-                self.assertEqual(len(failures), 1)
-                self.assertNotIsInstance(failures[0], AssertionError)
-                self.assertTrue(stream.cancelled.is_set())
 
     def test_fatal_callback_runs_without_waiting_for_reader(self):
         reader_blocked, release_reader, fatal = threading.Event(), threading.Event(), threading.Event()

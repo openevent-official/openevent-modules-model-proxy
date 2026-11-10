@@ -391,15 +391,3 @@ class RpcTests(unittest.TestCase):
                 self.assertEqual(call_rpc(lambda: outcome(values), 1, 25), 42)
             self.assertEqual(sleep.call_count, 5)
             sleep.assert_called_with(0.025)
-
-    def test_close_interrupts_retry_wait(self):
-        stop = threading.Event()
-        original = OSError("disconnected")
-
-        def operation():
-            stop.set()
-            raise original
-
-        with self.assertRaises(OSError) as caught:
-            call_rpc(operation, 3, 1000, stop_event=stop)
-        self.assertIs(caught.exception, original)

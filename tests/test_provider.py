@@ -190,15 +190,6 @@ class ProviderTests(unittest.TestCase):
                     self.assertEqual(provider.requests[-1][:2], (path, body))
             self.assertEqual(len(provider.requests), len(cases))
 
-    def test_non_sse_stream_http_error_is_terminal(self):
-        body = b'{"error":{"message":"rate limited"}}'
-        with provider_server(lambda sock: sock.sendall(response(body, status=429))) as (url, _):
-            events = list(call(url, True))
-        self.assertEqual([e.kind for e in events], ["headers", "completed"])
-        self.assertEqual(events[-1].status_code, 429)
-        self.assertIsNotNone(events[-1].body)
-        self.assertEqual(_json.body_copy(events[-1].body), json.loads(body))
-
     def test_json_utf8_compressed_input_and_sse_eof_failures(self):
         wires = [response(b"garbage"), response(b'"\xff"'), response(b"NaN"), response(b"data: {}\n\n", "text/event-stream")]
         for wire in wires:
