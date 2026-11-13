@@ -133,6 +133,45 @@ Provider, default-provider, and timeout settings affect only requests newly rece
 startup; they are not used to re-execute historical requests. Historical requests without a terminal
 state follow [LLM_PROTOCOL.md](LLM_PROTOCOL.md#82-outcomes-after-worker-restart).
 
+## Check the provider API
+
+From the source checkout, check a configured Provider directly:
+
+```bash
+./check-api.sh --config model-proxy.yaml --model your-model
+```
+
+The equivalent `make` entry is:
+
+```bash
+make check-api CHECK_API_ARGS='--config model-proxy.yaml --model your-model'
+```
+
+`PYTHON` selects the Python interpreter for either entry; its environment must already contain
+the project's dependencies. The check loads and validates the existing complete Worker YAML file,
+including its required fields. It uses `default_provider` unless `--provider other` selects another
+name in `providers`. `--model` is required because the Worker configuration does not select a model.
+
+The check sends one streaming `POST /v1/chat/completions` request asking `Reply with OK.` using the
+selected Provider's URL and API key. This is a real model call and may incur Provider API charges.
+It does not connect to OpenEvent, publish events, or retry the request. Provider timeouts and
+`max_payload_bytes` use the [field rules above](#fields); the check adds no overall request deadline.
+
+Progress appears as the response arrives: HTTP status and time to response headers, time to the
+first complete SSE data event, and total time when the response completes. The first data event
+is not necessarily a text token. A non-2xx HTTP status fails immediately; other failures identify
+whether they occurred before response headers or while reading the response body. `PASS` requires
+a 2xx status and normal completion. Output does not include the API key or raw response body.
+
+The script returns the statuses below; `make` uses its own exit status when a target fails.
+
+| Exit status | Meaning |
+| --- | --- |
+| `0` | Provider check passed |
+| `1` | Provider request failed |
+| `2` | Command-line arguments or configuration are invalid |
+| `130` | Interrupted with Ctrl+C |
+
 ## Preparation
 
 For Channel, membership, and single-Worker deployment requirements, see

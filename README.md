@@ -87,12 +87,21 @@ PYTHONPATH=src python3 -B -m openevent.model_proxy.cli --config model-proxy.yaml
 
 See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for a configuration example.
 
+To check the configured model API directly from this checkout:
+
+```bash
+./check-api.sh --config model-proxy.yaml --model your-model
+```
+
+See [Check the provider API](docs/CONFIGURATION.md#check-the-provider-api) for Provider selection,
+the `make` entry, progress output, and exit statuses.
+
 ## Documentation
 
 | Document | Contents |
 | --- | --- |
 | [docs/LLM_PROTOCOL.md](docs/LLM_PROTOCOL.md) | `llm.v1` payload fields, message state machine, status codes, header forwarding, payload-size behavior, and observable recovery contract |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Worker configuration, provider URLs, and timeouts |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Worker configuration, provider URLs, timeouts, and direct API checks |
 | [docs/OPEN_EVENT_RPC_RETRY.md](docs/OPEN_EVENT_RPC_RETRY.md) | Common retry rules for ordinary OpenEvent RPCs, including GetStatus, Fetch, UUID allocation and lookup, and Subscribe |
 | [docs/RESULT_PUBLISHING.md](docs/RESULT_PUBLISHING.md) | UUID freezing, reliable publishing, UUID reconciliation, and `ResultPublishError` commit states for one event |
 | [docs/SDK_API.md](docs/SDK_API.md) | Public Python SDK signatures, return objects, exceptions, and lifecycle |

@@ -113,6 +113,41 @@ provider、默认 provider 和 timeout 配置只影响 Worker 启动后新收到
 历史未终态 request 的结果形态以
 [LLM_PROTOCOL_cn.md](LLM_PROTOCOL_cn.md#82-worker-重启后的结果) 为准。
 
+## 检查 Provider API
+
+在源码仓库中直接检查已配置的 Provider：
+
+```bash
+./check-api.sh --config model-proxy.yaml --model your-model
+```
+
+等价的 `make` 入口是：
+
+```bash
+make check-api CHECK_API_ARGS='--config model-proxy.yaml --model your-model'
+```
+
+两个入口都通过 `PYTHON` 选择 Python 解释器，其环境必须已经安装本项目依赖。检查会读取并校验现有的完整 Worker YAML
+配置，包括其中的必填字段。默认使用 `default_provider`；可通过 `--provider other` 选择 `providers` 中的其他名称。
+`--model` 必填，因为 Worker 配置本身不指定模型。
+
+检查使用所选 Provider 的 URL 和 API key，发送一次要求 `Reply with OK.` 的流式 `POST /v1/chat/completions` 请求。
+这会实际调用模型，可能产生 Provider API 费用；不连接 OpenEvent、不发布事件，也不重试请求。
+Provider 超时和 `max_payload_bytes` 沿用[上文的字段规则](#字段)，检查不另设整次请求的总时限。
+
+响应过程中即时打印进展：HTTP 状态和收到响应头的耗时、首个完整 SSE data 事件的耗时，以及正常完成时的总耗时。
+首个 data 事件不一定包含文字 token。非 2xx HTTP 状态立即判为失败；其他失败会区分发生在收到响应头之前还是读取响应体期间。
+只有 HTTP 状态为 2xx 且响应正常完成才输出 `PASS`。输出不包含 API key 或原始响应体。
+
+脚本的退出码如下；`make` 在 target 失败时使用自身的退出码。
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | Provider 检查通过 |
+| `1` | Provider 请求失败 |
+| `2` | 命令行参数或配置不合法 |
+| `130` | 被 Ctrl+C 中断 |
+
 ## 运行前准备
 
 Channel、成员及单 Worker 部署要求见 [LLM_PROTOCOL_cn.md 第 2 节](LLM_PROTOCOL_cn.md#2-channel-与-openevent-字段)。

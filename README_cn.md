@@ -81,12 +81,20 @@ PYTHONPATH=src python3 -B -m openevent.model_proxy.cli --config model-proxy.yaml
 
 配置文件示例见 [docs/CONFIGURATION_cn.md](docs/CONFIGURATION_cn.md)。
 
+在本源码仓库中直接检查已配置的模型 API：
+
+```bash
+./check-api.sh --config model-proxy.yaml --model your-model
+```
+
+Provider 选择、`make` 入口、进展输出和退出码见[检查 Provider API](docs/CONFIGURATION_cn.md#检查-provider-api)。
+
 ## 文档
 
 | 文档 | 内容 |
 | --- | --- |
 | [docs/LLM_PROTOCOL_cn.md](docs/LLM_PROTOCOL_cn.md) | `llm.v1` payload 字段、消息状态机、状态码、响应头转发、payload 大小行为和对外恢复契约 |
-| [docs/CONFIGURATION_cn.md](docs/CONFIGURATION_cn.md) | Worker 配置、provider URL 和 timeout |
+| [docs/CONFIGURATION_cn.md](docs/CONFIGURATION_cn.md) | Worker 配置、provider URL、timeout 和 API 直接检查 |
 | [docs/OPEN_EVENT_RPC_RETRY_cn.md](docs/OPEN_EVENT_RPC_RETRY_cn.md) | GetStatus、Fetch、UUID 分配与查询、Subscribe 等普通 OpenEvent RPC 的统一重试规则 |
 | [docs/RESULT_PUBLISHING_cn.md](docs/RESULT_PUBLISHING_cn.md) | 单条事件的 UUID 冻结、可靠发布、UUID 对账和 `ResultPublishError` 提交状态 |
 | [docs/SDK_API_cn.md](docs/SDK_API_cn.md) | Python SDK 的公开签名、返回对象、异常和生命周期 |
